@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Turn a buckit spec into an implementation plan at docs/features/<slug>-plan.md — an ordered checklist the /implement skill checks off. Use AFTER /refine has produced <slug>-spec.md and it's approved. Produces the "how"; stops for review before /implement.
+description: Turn a cubby spec into an implementation plan at docs/features/<slug>-plan.md — an ordered checklist the /implement skill checks off. Use AFTER /refine has produced <slug>-spec.md and it's approved. Produces the "how"; stops for review before /implement.
 argument-hint: <slug (matches docs/features/<slug>-spec.md)>
 ---
 
@@ -42,7 +42,7 @@ change — in that case the box still exists but reads "confirm no README change
 needed". Never leave docs implicit; make it a box someone has to tick.
 
 If `README.md` doesn't exist yet, the step creates it — leading with
-`./buckit serve` per CONCEPT's Distribution section.
+`./cubby serve` per CONCEPT's Distribution section.
 
 ## Cite the tiebreaker
 

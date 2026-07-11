@@ -52,7 +52,7 @@ Per-step TDD: unit tests for the pure module and DB methods, in-process
   `new_upload_id`; small, no toolchain impact.
 - `tests/s3_api.rs` — integration tests driving `aws-sdk-s3` multipart.
 - `tests/acceptance/multipart.sh` — live harness: boto3 100MB round-trip + AWS
-  CLI lifecycle/field asserts against `buckit serve --port 0`.
+  CLI lifecycle/field asserts against `cubby serve --port 0`.
 - `README.md` — document the multipart operations + composite ETag (Docs step).
 
 ## Risks & unknowns
@@ -151,7 +151,7 @@ outcome is real, not when code is written.
 
 Mirrors the spec. `/implement` isn't done until every box passes by driving the
 named client — **boto3** (forces multipart at 8MB) + the **AWS CLI** for
-per-verb field asserts — against a live `buckit serve --port 0`, via a harness
+per-verb field asserts — against a live `cubby serve --port 0`, via a harness
 `tests/acceptance/multipart.sh` (paralleling `listing.sh`).
 
 - [x] **boto3 100MB round-trip** — `upload_file` of a 100MB file with default

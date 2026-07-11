@@ -1,6 +1,6 @@
 //! Data-directory layout and bootstrap.
 //!
-//! A buckit data directory is self-contained: delete it for a factory reset,
+//! A cubby data directory is self-contained: delete it for a factory reset,
 //! copy it to clone an environment. Layout (per CONCEPT):
 //!
 //! ```text
@@ -15,7 +15,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A handle to a buckit data directory and the paths within it.
+/// A handle to a cubby data directory and the paths within it.
 #[derive(Debug, Clone)]
 pub struct DataDir {
     root: PathBuf,

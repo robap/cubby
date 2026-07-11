@@ -1,4 +1,4 @@
-//! Shared test harness: spawn an in-process buckit server on an ephemeral port
+//! Shared test harness: spawn an in-process cubby server on an ephemeral port
 //! and hand back an `aws-sdk-s3` client pointed at it (path-style addressing).
 
 #![allow(dead_code)]
@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::{Client, Config};
-use buckit::datadir::DataDir;
-use buckit::db::Db;
-use buckit::http::{build_router, run_accept_loop, ServeConfig};
+use cubby::datadir::DataDir;
+use cubby::db::Db;
+use cubby::http::{build_router, run_accept_loop, ServeConfig};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -75,7 +75,7 @@ impl TestServer {
     pub fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
         self.datadir
             .bucket_dir(bucket)
-            .join(buckit::keypath::key_to_relpath(key))
+            .join(cubby::keypath::key_to_relpath(key))
     }
 
     /// Insert a synthetic object row directly (used before PutObject exists, to

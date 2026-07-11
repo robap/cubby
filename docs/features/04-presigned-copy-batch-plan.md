@@ -104,7 +104,7 @@ outcome is real, not when code is written.
 - [x] **Docs** — update `README.md`: add CopyObject + DeleteObjects to the
       supported-operations list, show presigned-URL generation/use, and add the
       one-paragraph presigned host-in-signature Docker gotcha (CONCEPT sharp
-      edge). Create `README.md` leading with `./buckit serve` if it doesn't
+      edge). Create `README.md` leading with `./cubby serve` if it doesn't
       exist yet.
 
 ## Acceptance
@@ -163,9 +163,9 @@ named client against the running server.
   query-string SigV4 (GET/PUT, expiry, tamper) with no handler change.
 - **boto3 presigned PUT defaults to SigV2.** `generate_presigned_url("put_object")`
   emits a legacy `AWSAccessKeyId/Signature/Expires` (SigV2) URL unless the client
-  is built with `Config(signature_version="s3v4")`; buckit (via `s3s`) validates
+  is built with `Config(signature_version="s3v4")`; cubby (via `s3s`) validates
   SigV4 only, so a SigV2 URL is `403 SignatureDoesNotMatch`. This is standard for
-  S3-compatible endpoints (MinIO documents the same) — not a buckit gap. The
+  S3-compatible endpoints (MinIO documents the same) — not a cubby gap. The
   acceptance script pins `s3v4` for the PUT and the README calls it out. (GET
   happens to default to SigV4, so it worked unpinned.)
 - **`s3s` does not enforce the 1000-key DeleteObjects bound** (its access-layer

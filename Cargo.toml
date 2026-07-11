@@ -1,12 +1,12 @@
 [package]
-name = "buckit"
+name = "cubby"
 version = "0.1.0"
 edition = "2021"
 description = "The SQLite of S3 — a single-binary, S3-compatible object store for local development"
 license = "MIT"
 
 [[bin]]
-name = "buckit"
+name = "cubby"
 path = "src/main.rs"
 
 [dependencies]

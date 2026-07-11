@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Phase 4 acceptance: drive real boto3, aws-sdk-js v3, and the AWS CLI against a
-# live buckit server, proving presigned (query-string) auth, CopyObject, and
+# live cubby server, proving presigned (query-string) auth, CopyObject, and
 # batch DeleteObjects end to end. This is the outer verification loop for
 # docs/features/04-presigned-copy-batch-spec.md — the aws-sdk-s3 integration
 # tests in tests/s3_api.rs are the inner loop.
@@ -13,11 +13,11 @@
 
 set -uo pipefail
 
-# --- locate (building if needed) the buckit binary -------------------------
+# --- locate (building if needed) the cubby binary -------------------------
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-BIN="$ROOT/target/debug/buckit"
+BIN="$ROOT/target/debug/cubby"
 if [ ! -x "$BIN" ]; then
-  echo "building buckit…"
+  echo "building cubby…"
   (cd "$ROOT" && cargo build) || exit 1
 fi
 
@@ -63,7 +63,7 @@ for _ in $(seq 1 50); do
 done
 [ -z "$ADDR" ] && { echo "server did not start"; cat "$WORK/server.log"; exit 1; }
 EP="http://$ADDR"
-export BUCKIT_EP="$EP"
+export CUBBY_EP="$EP"
 echo "server at $EP"
 
 awss3()  { aws --endpoint-url "$EP" s3 "$@"; }
@@ -80,7 +80,7 @@ awsapi put-object --bucket bkt --key hello.txt --body "$WORK/hello.txt" >/dev/nu
 # --- 1) boto3 presigned GET (the headline) ---------------------------------
 "$PY" - <<'PY'
 import os, urllib.request, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 url = s3.generate_presigned_url("get_object", Params={"Bucket": "bkt", "Key": "hello.txt"})
@@ -95,12 +95,12 @@ PY
 
 # --- 2) boto3 presigned PUT ------------------------------------------------
 # boto3 defaults `generate_presigned_url("put_object")` to the legacy SigV2
-# query scheme; S3-compatible endpoints (buckit, MinIO, …) want SigV4, so the
+# query scheme; S3-compatible endpoints (cubby, MinIO, …) want SigV4, so the
 # client pins `signature_version="s3v4"`. GET happens to default to SigV4.
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, urllib.request, boto3
 from botocore.config import Config
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1",
                   config=Config(signature_version="s3v4"))
@@ -114,7 +114,7 @@ with urllib.request.urlopen(req) as r:
 got = s3.get_object(Bucket="bkt", Key="up.txt")["Body"].read()
 assert got == payload, got
 # Real file on disk, cmp-clean.
-disk = os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt", "up.txt")
+disk = os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt", "up.txt")
 assert open(disk, "rb").read() == payload, "on-disk bytes differ"
 print("OK")
 PY
@@ -158,7 +158,7 @@ if command -v node >/dev/null && command -v npm >/dev/null; then
     cat > "$JSDIR/presign.mjs" <<'JS'
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-const ep = process.env.BUCKIT_EP;
+const ep = process.env.CUBBY_EP;
 const s3 = new S3Client({
   endpoint: ep, region: "us-east-1", forcePathStyle: true,
   credentials: { accessKeyId: "local", secretAccessKey: "localsecret" },
@@ -170,7 +170,7 @@ if (res.status !== 200) { console.error("status", res.status, text); process.exi
 if (text !== "hello presigned world\n") { console.error("body mismatch:", JSON.stringify(text)); process.exit(1); }
 console.log("OK");
 JS
-    if ( cd "$JSDIR" && BUCKIT_EP="$EP" node presign.mjs ); then
+    if ( cd "$JSDIR" && CUBBY_EP="$EP" node presign.mjs ); then
       ok "aws-sdk-js v3 getSignedUrl + fetch (no creds) → 200 + bytes"
     else
       bad "aws-sdk-js v3 presigned GET"
@@ -187,9 +187,9 @@ echo "=============== CopyObject ==============="
 # --- 7) boto3 copy: bytes + preserved source ETag --------------------------
 head -c 4096 /dev/urandom > "$WORK/src.bin"
 awsapi put-object --bucket bkt --key src.bin --body "$WORK/src.bin" >/dev/null
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 src_etag = s3.head_object(Bucket="bkt", Key="src.bin")["ETag"]
@@ -197,7 +197,7 @@ s3.copy_object(CopySource="bkt/src.bin", Bucket="bkt", Key="dst.bin")
 dst = s3.head_object(Bucket="bkt", Key="dst.bin")
 assert dst["ETag"] == src_etag, (dst["ETag"], src_etag)
 body = s3.get_object(Bucket="bkt", Key="dst.bin")["Body"].read()
-assert body == open(os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt", "src.bin"), "rb").read()
+assert body == open(os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt", "src.bin"), "rb").read()
 print("OK")
 PY
 [ $? -eq 0 ] && ok "boto3 copy_object: dst bytes == src, dest ETag == source ETag" || bad "boto3 copy_object"
@@ -219,7 +219,7 @@ fi
 # --- 9) metadata-directive COPY carries source metadata --------------------
 "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 s3.put_object(Bucket="bkt", Key="meta-src", Body=b"{}",
@@ -233,19 +233,19 @@ PY
 [ $? -eq 0 ] && ok "copy COPY-directive carries source content-type + metadata" || bad "copy COPY metadata"
 
 # --- 10) source==dest REPLACE (metadata-only update) -----------------------
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 s3.put_object(Bucket="bkt", Key="k", Body=b"original-bytes", ContentType="application/octet-stream")
-before = open(os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt", "k"), "rb").read()
+before = open(os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt", "k"), "rb").read()
 s3.copy_object(CopySource="bkt/k", Bucket="bkt", Key="k",
                MetadataDirective="REPLACE", ContentType="text/plain", Metadata={"v": "2"})
 h = s3.head_object(Bucket="bkt", Key="k")
 assert h["ContentType"] == "text/plain", h["ContentType"]
 assert h["Metadata"].get("v") == "2", h["Metadata"]
-after = open(os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt", "k"), "rb").read()
+after = open(os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt", "k"), "rb").read()
 assert before == after == b"original-bytes", "bytes must be untouched"
 print("OK")
 PY
@@ -255,7 +255,7 @@ PY
 "$PY" - <<'PY'
 import os, boto3
 from botocore.exceptions import ClientError
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 try:
@@ -271,7 +271,7 @@ PY
 "$PY" - <<'PY'
 import os, boto3
 from botocore.exceptions import ClientError
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 def code(cs):
@@ -290,7 +290,7 @@ PY
 head -c 20971520 /dev/urandom > "$WORK/mp.bin"   # 20MB → boto3 multiparts >8MB
 "$PY" - "$WORK/mp.bin" <<'PY'
 import os, sys, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 s3.upload_file(sys.argv[1], "bkt", "mp.bin")  # auto-multipart
@@ -308,9 +308,9 @@ cmp -s "$DATADIR/buckets/bkt/mp-copy.bin" "$WORK/mp.bin" \
 echo "=============== DeleteObjects (batch) ==============="
 
 # --- 14) boto3 batch delete ------------------------------------------------
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 for k in ("d1", "d2", "d3"):
@@ -319,7 +319,7 @@ resp = s3.delete_objects(Bucket="bkt", Delete={"Objects": [{"Key": "d1"}, {"Key"
 deleted = sorted(d["Key"] for d in resp.get("Deleted", []))
 assert deleted == ["d1", "d2", "d3"], deleted
 assert not resp.get("Errors"), resp.get("Errors")
-base = os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt")
+base = os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt")
 for k in ("d1", "d2", "d3"):
     assert not os.path.exists(os.path.join(base, k)), f"{k} still on disk"
 present = {o["Key"] for o in s3.list_objects_v2(Bucket="bkt").get("Contents", [])}
@@ -331,7 +331,7 @@ PY
 # --- 15) batch delete is idempotent (never-existed key) --------------------
 "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 s3.put_object(Bucket="bkt", Key="real1", Body=b"x")
@@ -344,9 +344,9 @@ PY
 [ $? -eq 0 ] && ok "batch delete idempotent: never-existed key reported deleted" || bad "batch delete idempotency"
 
 # --- 16) quiet mode --------------------------------------------------------
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 for k in ("q1", "q2"):
@@ -354,7 +354,7 @@ for k in ("q1", "q2"):
 resp = s3.delete_objects(Bucket="bkt", Delete={"Objects": [{"Key": "q1"}, {"Key": "q2"}], "Quiet": True})
 assert not resp.get("Deleted"), resp.get("Deleted")
 assert not resp.get("Errors"), resp.get("Errors")
-base = os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt")
+base = os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt")
 for k in ("q1", "q2"):
     assert not os.path.exists(os.path.join(base, k)), f"{k} still on disk"
 print("OK")

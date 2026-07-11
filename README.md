@@ -1,9 +1,9 @@
-# buckit
+# cubby
 
 > The SQLite of S3 — a single MIT-licensed binary that stores objects as plain
 > files on disk and starts in milliseconds with zero config.
 
-buckit is an S3-compatible object store built for local development. Objects are
+cubby is an S3-compatible object store built for local development. Objects are
 real files in a browsable directory tree (`ls` works, `cat` works), and all
 metadata lives in one SQLite database. Delete the data directory for a factory
 reset; copy it to clone your environment.
@@ -11,7 +11,7 @@ reset; copy it to clone your environment.
 ## Quick start
 
 ```console
-$ ./buckit serve ./s3data
+$ ./cubby serve ./s3data
   S3 API   → http://127.0.0.1:9000   (access key: local / secret: localsecret)
   Web UI   → http://127.0.0.1:9000/_/
   Data dir → /home/you/project/s3data
@@ -49,8 +49,8 @@ Configure the AWS CLI with the default credentials (`aws configure`): access key
 | `<DIR>` | — | Data directory (positional, required). Created on first run. |
 | `--bind <ADDR>` | `127.0.0.1` | Address to bind. Use `0.0.0.0` to expose. |
 | `--port <PORT>` | `9000` | Port. `0` binds an ephemeral port, printed machine-parseably. |
-| `--access-key <KEY>` | `local` | Access key clients must present (env: `BUCKIT_ACCESS_KEY`). |
-| `--secret-key <KEY>` | `localsecret` | Secret key clients sign with (env: `BUCKIT_SECRET_KEY`). |
+| `--access-key <KEY>` | `local` | Access key clients must present (env: `CUBBY_ACCESS_KEY`). |
+| `--secret-key <KEY>` | `localsecret` | Secret key clients sign with (env: `CUBBY_SECRET_KEY`). |
 
 ## Supported operations (Phase 1)
 
@@ -135,7 +135,7 @@ ergonomics — tests can drive the whole lifecycle with tiny parts).
 An SDK can sign a short-lived URL that carries the whole SigV4 signature in the
 query string (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Signature`,
 `X-Amz-Expires`, …), so a browser, a `curl`, or a service with **no
-credentials** can `GET` or `PUT` a single object. buckit validates these exactly
+credentials** can `GET` or `PUT` a single object. cubby validates these exactly
 like header-signed requests — nothing to enable.
 
 ```console
@@ -148,7 +148,7 @@ $ curl "$URL" -o report.pdf        # no credentials needed
 boto3 (`generate_presigned_url("get_object" | "put_object", …)`) and aws-sdk-js
 v3 (`@aws-sdk/s3-request-presigner` `getSignedUrl`) generate the same URLs.
 Create the boto3 client with `Config(signature_version="s3v4")` — boto3 defaults
-a presigned **PUT** to the legacy SigV2 query scheme, which buckit (like MinIO)
+a presigned **PUT** to the legacy SigV2 query scheme, which cubby (like MinIO)
 does not accept; SigV4 is what modern apps use. A presigned `PUT` uses
 `UNSIGNED-PAYLOAD`; the body still streams through the
 normal write path and gets a correct content-MD5 ETag. A URL fetched after its
@@ -159,7 +159,7 @@ URL with a tampered path or query is `403 SignatureDoesNotMatch`.
 > header, so a URL signed for `localhost:9000` will fail with
 > `SignatureDoesNotMatch` if it is replayed against a different host:port — the
 > classic Docker-Compose case where one container signs for `localhost` but the
-> URL is used against the `buckit` service name (or vice versa). This is correct
+> URL is used against the `cubby` service name (or vice versa). This is correct
 > S3 behavior, not a bug: sign the URL for the **same** host the client will use
 > to fetch it.
 

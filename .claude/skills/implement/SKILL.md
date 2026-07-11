@@ -1,6 +1,6 @@
 ---
 name: implement
-description: Execute a buckit plan at docs/features/<slug>-plan.md — work its checklist top to bottom, checking boxes only when their outcome is observably true, driving the real client for acceptance boxes. Use AFTER /plan has produced an approved <slug>-plan.md.
+description: Execute a cubby plan at docs/features/<slug>-plan.md — work its checklist top to bottom, checking boxes only when their outcome is observably true, driving the real client for acceptance boxes. Use AFTER /plan has produced an approved <slug>-plan.md.
 argument-hint: <slug (matches docs/features/<slug>-plan.md)>
 ---
 
@@ -20,7 +20,7 @@ is your contract and your progress record.
 ## The discipline that makes checkboxes mean something
 
 - **Check `- [x]` only when the box's stated outcome is observably true** — the
-  behavior happens, not "the code is written". This is buckit's whole DoD:
+  behavior happens, not "the code is written". This is cubby's whole DoD:
   "boto3 round-trips it" ≠ "I wrote the handler".
 - **One box ≈ one commit's worth of change** — that's the *sizing* rule for a
   box, not an instruction to commit. **Do NOT run `git commit`, `git add`, or

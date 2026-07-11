@@ -666,38 +666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "buckit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-smithy-types",
- "base64",
- "bytes",
- "clap",
- "futures",
- "getrandom 0.2.17",
- "hex",
- "hyper 1.10.1",
- "hyper-util",
- "md-5 0.10.6",
- "percent-encoding",
- "rusqlite",
- "s3s",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -929,6 +897,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
+]
+
+[[package]]
+name = "cubby"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "base64",
+ "bytes",
+ "clap",
+ "futures",
+ "getrandom 0.2.17",
+ "hex",
+ "hyper 1.10.1",
+ "hyper-util",
+ "md-5 0.10.6",
+ "percent-encoding",
+ "rusqlite",
+ "s3s",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

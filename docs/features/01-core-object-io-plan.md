@@ -4,7 +4,7 @@
 
 ## Approach
 
-A single binary crate `buckit`. `main` parses CLI (`clap`), bootstraps the data
+A single binary crate `cubby`. `main` parses CLI (`clap`), bootstraps the data
 dir, opens `meta.sqlite` (WAL), and starts a `hyper` server whose top layer
 routes: `/_/*` → 501 stub, and everything else → the `s3s` service. `s3s` owns
 the wire protocol, header SigV4, and XML; we implement its `S3` trait against a
@@ -63,9 +63,9 @@ for handlers. The spec's named end-to-end verifier is the **AWS CLI**, run via
 Each box ≈ one small commit moving an observable behavior. Check only when the
 outcome is real, not when code is written.
 
-- [x] **Scaffold crate** — `cargo build` succeeds; `buckit --help` and
-      `buckit serve --help` list the flags.
-- [x] **Data-dir bootstrap** — `buckit serve ./s3data` creates `./s3data` with
+- [x] **Scaffold crate** — `cargo build` succeeds; `cubby --help` and
+      `cubby serve --help` list the flags.
+- [x] **Data-dir bootstrap** — `cubby serve ./s3data` creates `./s3data` with
       `.gitignore` (`*`), `buckets/`, `.tmp/`, `.multipart/`, and an (empty)
       `meta.sqlite`; re-running is idempotent.
 - [x] **SQLite schema v0** — `meta.sqlite` opens in WAL with `buckets` and
@@ -97,7 +97,7 @@ outcome is real, not when code is written.
       key; subsequent GET/HEAD → `NoSuchKey`.
 - [x] **Error-code sweep** — confirm every negative path returns the S3 code the
       spec lists (a consolidation pass over prior boxes; add tests for any gap).
-- [x] **Docs** — create `README.md` leading with `./buckit serve`; document the
+- [x] **Docs** — create `README.md` leading with `./cubby serve`; document the
       `serve` flags, default credentials, supported bucket/object operations,
       and path-style-only addressing.
 
@@ -121,10 +121,10 @@ outcome is real, not when code is written.
 ## Acceptance
 
 Mirrors the spec. All boxes verified by driving the real **AWS CLI**
-(aws-cli/2.35, path-style) against a live `buckit serve --port 0`, plus the
+(aws-cli/2.35, path-style) against a live `cubby serve --port 0`, plus the
 filesystem assertions — 32/32 checks passed.
 
-- [x] `buckit serve ./s3data` prints the banner and creates `./s3data` with
+- [x] `cubby serve ./s3data` prints the banner and creates `./s3data` with
       `.gitignore`=`*`, `buckets/`, `.tmp/`, `.multipart/`, `meta.sqlite`.
 - [x] `aws s3api create-bucket --bucket uploads` → 200; `s3data/buckets/uploads/`
       exists.

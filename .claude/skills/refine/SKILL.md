@@ -1,6 +1,6 @@
 ---
 name: refine
-description: Turn a rough buckit feature idea into a durable spec at docs/features/<slug>-spec.md. Use at the START of any new feature or roadmap phase, before planning. Produces the "what and why" with client-observable acceptance criteria; stops for review before /plan.
+description: Turn a rough cubby feature idea into a durable spec at docs/features/<slug>-spec.md. Use at the START of any new feature or roadmap phase, before planning. Produces the "what and why" with client-observable acceptance criteria; stops for review before /plan.
 argument-hint: <feature description or roadmap phase>
 ---
 

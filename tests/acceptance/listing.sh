@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Phase 2 acceptance: drive the real rclone + AWS CLI against a live buckit
+# Phase 2 acceptance: drive the real rclone + AWS CLI against a live cubby
 # server, exercising ListObjectsV2 and legacy ListObjects end to end. This is
 # the outer verification loop for docs/features/02-listing-delimiters-spec.md —
 # the aws-sdk-s3 integration tests in tests/s3_api.rs are the inner loop.
@@ -18,11 +18,11 @@
 
 set -uo pipefail
 
-# --- locate (building if needed) the buckit binary -------------------------
+# --- locate (building if needed) the cubby binary -------------------------
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-BIN="$ROOT/target/debug/buckit"
+BIN="$ROOT/target/debug/cubby"
 if [ ! -x "$BIN" ]; then
-  echo "building buckit…"
+  echo "building cubby…"
   (cd "$ROOT" && cargo build) || exit 1
 fi
 

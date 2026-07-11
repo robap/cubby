@@ -1,5 +1,5 @@
 //! End-to-end tests driving the real `aws-sdk-s3` client against an in-process
-//! buckit server — the inner-loop proxy for the AWS CLI acceptance criteria.
+//! cubby server — the inner-loop proxy for the AWS CLI acceptance criteria.
 
 mod common;
 
@@ -215,7 +215,7 @@ async fn put_object_writes_real_bytes_and_correct_etag() {
     let client = server.client();
     make_bucket(&client, "uploads").await;
 
-    let data = b"hello buckit, these are real cat-able bytes on disk".to_vec();
+    let data = b"hello cubby, these are real cat-able bytes on disk".to_vec();
     let out = client
         .put_object()
         .bucket("uploads")
@@ -919,7 +919,7 @@ async fn v2_encoding_type_url_round_trips_a_weird_key() {
         ["my%20report%20%28v2%29.txt"],
         "key is URL-encoded on the wire"
     );
-    assert_eq!(buckit::listing::url_encode(weird), keys[0]);
+    assert_eq!(cubby::listing::url_encode(weird), keys[0]);
 
     // Without encoding-type the same key lists literally (encoding is
     // presentation-only; the stored key is unchanged).

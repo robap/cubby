@@ -14,14 +14,14 @@ before listing/multipart/UI build on it.
 North stars served:
 - **The filesystem is the API too** — a `PUT` lands as a real, `cat`-able file
   at a derived path under `buckets/`.
-- **Starts in milliseconds, zero config** — `buckit serve ./s3data` bootstraps
+- **Starts in milliseconds, zero config** — `cubby serve ./s3data` bootstraps
   the data dir and is ready with default credentials, no setup.
 - **Compatibility is proven** — the AWS CLI, driving one operation at a time,
   is the acceptance client.
 
 ## In scope
 
-- **`serve` CLI + bootstrap.** `buckit serve <dir>` creates `<dir>` with a
+- **`serve` CLI + bootstrap.** `cubby serve <dir>` creates `<dir>` with a
   self-`.gitignore` (`*`), `buckets/`, `.tmp/`, `.multipart/`, and
   `meta.sqlite` (WAL). Prints the startup banner (S3 API URL, access/secret,
   data dir). Flags: `--bind` (default `127.0.0.1`), `--port` (default `9000`,
@@ -100,7 +100,7 @@ North stars served:
 Named client is the **AWS CLI** (low-level `s3api` for 1:1 op mapping), plus
 filesystem assertions. Each becomes a checkbox in the plan.
 
-- [ ] `buckit serve ./s3data` prints the banner and creates `./s3data` with
+- [ ] `cubby serve ./s3data` prints the banner and creates `./s3data` with
       `.gitignore` containing `*`, plus `buckets/`, `.tmp/`, `.multipart/`,
       `meta.sqlite`.
 - [ ] `aws s3api create-bucket --bucket uploads` → 200; `s3data/buckets/uploads/`

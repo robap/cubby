@@ -1,9 +1,9 @@
 use clap::Parser;
 
-use buckit::cli::{Cli, Command};
-use buckit::datadir::DataDir;
-use buckit::db::Db;
-use buckit::http::{serve, ServeConfig};
+use cubby::cli::{Cli, Command};
+use cubby::datadir::DataDir;
+use cubby::db::Db;
+use cubby::http::{serve, ServeConfig};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

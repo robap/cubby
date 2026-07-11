@@ -50,7 +50,7 @@ impl hyper::service::Service<hyper::Request<Incoming>> for Router {
                 .status(hyper::StatusCode::NOT_IMPLEMENTED)
                 .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(Body::from(
-                    "buckit web UI is coming in Phase 5\n".to_owned(),
+                    "cubby web UI is coming in Phase 5\n".to_owned(),
                 ))
                 .expect("static 501 response is valid");
             return Box::pin(async move { Ok(resp) });

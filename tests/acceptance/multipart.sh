@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Phase 3 acceptance: drive real boto3 (which auto-switches to multipart at 8MB)
-# and the AWS CLI against a live buckit server, exercising the full multipart
+# and the AWS CLI against a live cubby server, exercising the full multipart
 # lifecycle and the composite ETag end to end. This is the outer verification
 # loop for docs/features/03-multipart-etags-spec.md — the aws-sdk-s3 integration
 # tests in tests/s3_api.rs are the inner loop.
@@ -12,11 +12,11 @@
 
 set -uo pipefail
 
-# --- locate (building if needed) the buckit binary -------------------------
+# --- locate (building if needed) the cubby binary -------------------------
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-BIN="$ROOT/target/debug/buckit"
+BIN="$ROOT/target/debug/cubby"
 if [ ! -x "$BIN" ]; then
-  echo "building buckit…"
+  echo "building cubby…"
   (cd "$ROOT" && cargo build) || exit 1
 fi
 
@@ -62,7 +62,7 @@ for _ in $(seq 1 50); do
 done
 [ -z "$ADDR" ] && { echo "server did not start"; cat "$WORK/server.log"; exit 1; }
 EP="http://$ADDR"
-export BUCKIT_EP="$EP"
+export CUBBY_EP="$EP"
 echo "server at $EP"
 
 awss3()  { aws --endpoint-url "$EP" s3 "$@"; }
@@ -77,7 +77,7 @@ head -c 104857600 /dev/urandom > "$WORK/big.bin"
 "$PY" - "$WORK/big.bin" <<'PY'
 import sys, hashlib, boto3, os
 from boto3.s3.transfer import TransferConfig
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 src = sys.argv[1]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
@@ -129,10 +129,10 @@ PY
 if [ $? -eq 0 ]; then ok "composite ETag equals independent md5-of-md5s-N"; else bad "composite ETag mismatch"; fi
 
 # --- 3) explicit low-level lifecycle (boto3) -------------------------------
-# BUCKIT_DATADIR is exported so the staging-dir filesystem assertion can see it.
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+# CUBBY_DATADIR is exported so the staging-dir filesystem assertion can see it.
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 key = "lifecycle.bin"
@@ -147,16 +147,16 @@ out = s3.complete_multipart_upload(Bucket="bkt", Key=key, UploadId=uid,
 assert out["ETag"].strip('"').endswith("-3"), out["ETag"]
 got = s3.get_object(Bucket="bkt", Key=key)["Body"].read()
 assert got == b"".join(bodies)
-staging = os.path.join(os.environ["BUCKIT_DATADIR"], ".multipart", uid)
+staging = os.path.join(os.environ["CUBBY_DATADIR"], ".multipart", uid)
 assert not os.path.exists(staging), f"staging {staging} still exists"
 print("OK")
 PY
 if [ $? -eq 0 ]; then ok "explicit create/upload_part×3/complete; bytes concat; staging gone"; else bad "low-level lifecycle"; fi
 
 # --- 8) overwrite (boto3): single-PUT then multipart to the same key -------
-BUCKIT_DATADIR="$DATADIR" "$PY" - <<'PY'
+CUBBY_DATADIR="$DATADIR" "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 key = "over.bin"
@@ -173,7 +173,7 @@ out = s3.complete_multipart_upload(Bucket="bkt", Key=key, UploadId=uid,
 assert out["ETag"].strip('"').endswith("-2"), out["ETag"]
 got = s3.get_object(Bucket="bkt", Key=key)["Body"].read()
 assert got == b"".join(bodies), "multipart content did not replace single-put"
-disk = os.path.join(os.environ["BUCKIT_DATADIR"], "buckets", "bkt", key)
+disk = os.path.join(os.environ["CUBBY_DATADIR"], "buckets", "bkt", key)
 assert open(disk, "rb").read() == b"".join(bodies), "on-disk file not overwritten"
 print("OK")
 PY
@@ -182,7 +182,7 @@ if [ $? -eq 0 ]; then ok "overwrite: multipart replaces single-PUT (last writer 
 # --- 9) Range GET on assembled object (boto3) ------------------------------
 "$PY" - <<'PY'
 import os, boto3
-ep = os.environ["BUCKIT_EP"]
+ep = os.environ["CUBBY_EP"]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id="local",
                   aws_secret_access_key="localsecret", region_name="us-east-1")
 r = s3.get_object(Bucket="bkt", Key="big.bin", Range="bytes=8388600-8388700")

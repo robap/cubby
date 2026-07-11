@@ -1,6 +1,6 @@
 # CONCEPT
 
-> **buckit** — one binary, one port, one directory.
+> **cubby** — one binary, one port, one directory.
 > An S3-compatible object store built for local development — not a small
 > production server pretending to be a dev tool.
 
@@ -32,7 +32,7 @@ in milliseconds with zero config.
 ## The experience
 
 ```
-$ ./buckit serve ./s3data
+$ ./cubby serve ./s3data
   S3 API   → http://localhost:9000   (access key: local / secret: localsecret)
   Web UI   → http://localhost:9000/_/
   Data dir → /home/you/project/s3data
@@ -217,12 +217,12 @@ Steps 1–4 ≈ 2–3 weeks of evenings given `s3s` does the protocol.
 ## Distribution
 
 GitHub releases with prebuilt binaries (cargo-dist), Docker image on
-ghcr.io, `brew install` eventually. README leads with `./buckit serve`;
+ghcr.io, `brew install` eventually. README leads with `./cubby serve`;
 Docker is a footnote. Compose snippet in README from day one.
 
 ## Open questions
 
-- ~~Name.~~ **Decided: buckit.** (Note: "zero" the framework is nearly
+- ~~Name.~~ **Decided: cubby.** (Note: "zero" the framework is nearly
   unsearchable — worth addressing before this project gives it public
   exposure.)
 - Commit `dist/` UI assets? Leaning no: CI runs

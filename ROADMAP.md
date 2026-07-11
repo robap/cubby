@@ -205,7 +205,7 @@ This is a **dev tool**, not a production server in a costume.
 
 ## Open questions blocking milestones
 
-- ~~**Name**~~ — decided: **buckit**. (`zero`'s searchability is still worth
+- ~~**Name**~~ — decided: **cubby**. (`zero`'s searchability is still worth
   addressing before this project gives the framework public exposure.)
 - **Commit `dist/` UI assets?** Leaning no — CI builds fresh with
   `cargo install zero --locked` + `zero build`. Decide before Phase 5.

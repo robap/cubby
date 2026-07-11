@@ -1,6 +1,6 @@
 //! Command-line interface.
 //!
-//! `buckit serve <dir>` is the only subcommand for now; it boots the S3 server
+//! `cubby serve <dir>` is the only subcommand for now; it boots the S3 server
 //! against a data directory, creating it (and its layout) on first run.
 
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ pub const DEFAULT_SECRET_KEY: &str = "localsecret";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "buckit",
+    name = "cubby",
     about = "The SQLite of S3 — a single-binary object store for local development",
     version
 )]
@@ -43,11 +43,11 @@ pub struct ServeArgs {
     pub port: u16,
 
     /// Access key clients must present.
-    #[arg(long, env = "BUCKIT_ACCESS_KEY", default_value = DEFAULT_ACCESS_KEY)]
+    #[arg(long, env = "CUBBY_ACCESS_KEY", default_value = DEFAULT_ACCESS_KEY)]
     pub access_key: String,
 
     /// Secret key clients must sign with.
-    #[arg(long, env = "BUCKIT_SECRET_KEY", default_value = DEFAULT_SECRET_KEY)]
+    #[arg(long, env = "CUBBY_SECRET_KEY", default_value = DEFAULT_SECRET_KEY)]
     pub secret_key: String,
 }
 
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn serve_parses_dir_and_defaults() {
-        let cli = Cli::try_parse_from(["buckit", "serve", "./s3data"]).unwrap();
+        let cli = Cli::try_parse_from(["cubby", "serve", "./s3data"]).unwrap();
         let Command::Serve(args) = cli.command;
         assert_eq!(args.dir, PathBuf::from("./s3data"));
         assert_eq!(args.bind, "127.0.0.1");
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn serve_accepts_flag_overrides() {
         let cli = Cli::try_parse_from([
-            "buckit",
+            "cubby",
             "serve",
             "data",
             "--bind",

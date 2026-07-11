@@ -172,12 +172,12 @@ outcome is real, not when code is written.
 
 Mirrors the spec. `/implement` isn't done until every box passes by driving the
 named client — **rclone** (delimiter/pagination canary) + the **AWS CLI** for
-field-level asserts — against a live `buckit serve --port 0`. Fixture bucket
+field-level asserts — against a live `cubby serve --port 0`. Fixture bucket
 `photos`: `notes.txt`, `photos/index.md`, `photos/2024/a.jpg`,
 `photos/2024/b.jpg`, `photos/2025/c.jpg`.
 
 All boxes verified by a live harness (`tests/acceptance/listing.sh`) driving
-real rclone + AWS CLI against `buckit serve --port 0`: **16/16 checks PASS**.
+real rclone + AWS CLI against `cubby serve --port 0`: **16/16 checks PASS**.
 
 - [x] `rclone lsf remote:photos` → exactly `notes.txt` and `photos/`.
 - [x] `rclone lsf -R remote:photos` → all five keys, flat, lexicographic, no
