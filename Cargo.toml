@@ -1,0 +1,38 @@
+[package]
+name = "buckit"
+version = "0.1.0"
+edition = "2021"
+description = "The SQLite of S3 — a single-binary, S3-compatible object store for local development"
+license = "MIT"
+
+[[bin]]
+name = "buckit"
+path = "src/main.rs"
+
+[dependencies]
+s3s = "0.14.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+md-5 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+percent-encoding = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+bytes = "1"
+hex = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+aws-sdk-s3 = "1"
+aws-config = "1"
+aws-credential-types = "1"
+aws-smithy-types = "1"
+tempfile = "3"
