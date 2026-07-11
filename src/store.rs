@@ -11,14 +11,15 @@ use std::time::{Duration, SystemTime};
 
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
-    DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag, EncodingType, GetObjectInput,
-    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, ListPartsInput, ListPartsOutput, Metadata, Object, ObjectStorageClass,
-    Owner, Part, PutObjectInput, PutObjectOutput, StorageClass, StreamingBlob, Timestamp,
-    UploadPartInput, UploadPartOutput,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
+    CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+    ETag, EncodingType, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput,
+    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
+    Metadata, MetadataDirective, Object, ObjectStorageClass, Owner, Part, PutObjectInput,
+    PutObjectOutput, StorageClass, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -95,6 +96,43 @@ impl Store {
             return Err(err);
         }
         Ok((temp_path, size, hex::encode(hasher.finalize())))
+    }
+
+    /// Stream-copy a source object file into a fresh temp file in `.tmp/`,
+    /// `fsync`, and return its path. Bytes flow through `tokio::io::copy` a
+    /// chunk at a time — the object is never held in memory, the same discipline
+    /// as [`Store::stream_to_temp`]. The ETag is not recomputed: CopyObject
+    /// preserves the source row's ETag verbatim. The temp file is removed on
+    /// error. Caller renames it into the destination key.
+    async fn stage_file_copy(&self, src: &std::path::Path) -> S3Result<PathBuf> {
+        use tokio::io::AsyncWriteExt;
+
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = self
+            .dirs
+            .tmp_dir()
+            .join(format!("{}-{n}.copy", std::process::id()));
+        let mut out = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(internal)?;
+
+        let copy_result: S3Result<()> = async {
+            let mut input = tokio::fs::File::open(src).await.map_err(internal)?;
+            tokio::io::copy(&mut input, &mut out)
+                .await
+                .map_err(internal)?;
+            out.flush().await.map_err(internal)?;
+            out.sync_all().await.map_err(internal)?; // durability before rename
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = copy_result {
+            drop(out);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
+        Ok(temp_path)
     }
 
     /// Filesystem path of one staged part: `.multipart/<upload_id>/<part_number>`.
@@ -988,5 +1026,179 @@ impl s3s::S3 for Store {
         }
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let input = req.input;
+        let dest_bucket = input.bucket;
+        let dest_key = input.key;
+
+        // Only the `<bucket>/<key>` copy-source form is supported; access-point
+        // and Outpost ARNs never reach a path-style dev tool.
+        let (src_bucket, src_key) = match input.copy_source {
+            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
+            _ => {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "only <bucket>/<key> copy-source is supported"
+                ))
+            }
+        };
+
+        // Resolution errors, all before any bytes move. Loading the source row
+        // distinguishes NoSuchBucket (source bucket gone) from NoSuchKey.
+        let sb = src_bucket.clone();
+        let sk = src_key.clone();
+        let Some(src_row) = self.db_call(move |db| db.get_object(&sb, &sk)).await? else {
+            return Err(self.missing_object_error(&src_bucket).await);
+        };
+        let db_name = dest_bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&db_name)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {dest_bucket}"));
+        }
+
+        let replace = input
+            .metadata_directive
+            .as_ref()
+            .map(MetadataDirective::as_str)
+            == Some(MetadataDirective::REPLACE);
+        let same_object = src_bucket == dest_bucket && src_key == dest_key;
+
+        // Copying an object onto itself without changing metadata is illegal in
+        // S3 (SDKs probe this); only a REPLACE makes a self-copy meaningful.
+        if same_object && !replace {
+            return Err(s3_error!(
+                InvalidRequest,
+                "This copy request is illegal because it is trying to copy an object to \
+                 itself without changing the object's metadata, storage class, website \
+                 redirect location or encryption attributes."
+            ));
+        }
+
+        // COPY (default) carries the source row's content-type + user metadata;
+        // REPLACE takes them from the request (content-type defaulting as PUT).
+        let (content_type, metadata) = if replace {
+            let ct = input
+                .content_type
+                .or_else(|| Some(DEFAULT_CONTENT_TYPE.to_owned()));
+            let md =
+                serde_json::to_string(&input.metadata.unwrap_or_default()).map_err(internal)?;
+            (ct, md)
+        } else {
+            (src_row.content_type.clone(), src_row.metadata.clone())
+        };
+
+        // Bytes: for a self-copy the file already holds the right bytes, so skip
+        // the copy (metadata-only update). Otherwise stage the source through
+        // `.tmp/` → fsync → atomic rename into the destination key, reusing the
+        // Phase 1 write discipline so the copy is one real assembled file.
+        if !same_object {
+            let src_path = self
+                .dirs
+                .bucket_dir(&src_bucket)
+                .join(crate::keypath::key_to_relpath(&src_key));
+            let final_path = self
+                .dirs
+                .bucket_dir(&dest_bucket)
+                .join(crate::keypath::key_to_relpath(&dest_key));
+            let temp_path = self.stage_file_copy(&src_path).await?;
+            if let Some(parent) = final_path.parent() {
+                if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(internal(err));
+                }
+            }
+            if let Err(err) = tokio::fs::rename(&temp_path, &final_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(internal(err));
+            }
+        }
+
+        // Bytes durably in place; write the authoritative row last. The ETag is
+        // the source's, preserved verbatim (a multipart source keeps its `-N`).
+        let now = unix_now();
+        let etag = src_row.etag.clone();
+        let row = ObjectRow {
+            bucket: dest_bucket,
+            key: dest_key,
+            size: src_row.size,
+            etag: etag.clone(),
+            content_type,
+            last_modified: now,
+            metadata,
+        };
+        self.db_call(move |db| db.put_object(&row)).await?;
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(etag)),
+                last_modified: Some(ts_from_unix(now)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let quiet = input.delete.quiet.unwrap_or(false);
+        // `versionId` on an entry is ignored (no versioning); the key is deleted.
+        let keys: Vec<String> = input.delete.objects.into_iter().map(|o| o.key).collect();
+
+        // S3 bounds a batch at 1000 keys; `s3s` doesn't enforce it, so we do.
+        if keys.len() > 1000 {
+            return Err(s3_error!(
+                InvalidRequest,
+                "the batch delete request must contain 1000 keys or fewer"
+            ));
+        }
+
+        // A batch against a nonexistent bucket fails wholesale (no per-key
+        // results), matching S3.
+        let b = bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&b)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
+        }
+
+        // Rows first (source of truth) in one transaction, then best-effort
+        // unlink each file — the Phase 1 delete ordering, a NotFound ignored.
+        let b = bucket.clone();
+        let ks = keys.clone();
+        self.db_call(move |db| db.delete_objects(&b, &ks)).await?;
+        for key in &keys {
+            let path = self
+                .dirs
+                .bucket_dir(&bucket)
+                .join(crate::keypath::key_to_relpath(key));
+            if let Err(err) = tokio::fs::remove_file(&path).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(internal(err));
+                }
+            }
+        }
+
+        // Non-quiet: a `Deleted` entry per requested key (S3 reports even a
+        // never-existed key as deleted). Quiet: only errors, of which a
+        // dev-tool happy path has none — so an empty `DeleteResult`.
+        let deleted = (!quiet).then(|| {
+            keys.into_iter()
+                .map(|key| DeletedObject {
+                    key: Some(key),
+                    ..Default::default()
+                })
+                .collect()
+        });
+
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted,
+            ..Default::default()
+        }))
     }
 }

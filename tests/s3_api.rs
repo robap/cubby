@@ -1562,3 +1562,472 @@ async fn complete_error_paths() {
         .expect_err("bogus upload id must fail");
     assert_eq!(err.into_service_error().meta().code(), Some("NoSuchUpload"));
 }
+
+// --- CopyObject (Phase 4) --------------------------------------------------
+
+#[tokio::test]
+async fn copy_object_happy_path_carries_bytes_and_source_etag() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+
+    let data = b"the source bytes, copied verbatim onto a new key".to_vec();
+    let put = client
+        .put_object()
+        .bucket("bkt")
+        .key("src.bin")
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await
+        .unwrap();
+    let src_etag = put.e_tag().unwrap().to_owned();
+
+    let out = client
+        .copy_object()
+        .bucket("bkt")
+        .key("dst.bin")
+        .copy_source("bkt/src.bin")
+        .send()
+        .await
+        .expect("copy-object 200");
+
+    // CopyObjectResult carries the (preserved) source ETag.
+    let res = out
+        .copy_object_result()
+        .expect("copy_object_result present");
+    assert_eq!(
+        res.e_tag(),
+        Some(src_etag.as_str()),
+        "dest ETag == source ETag"
+    );
+    assert!(res.last_modified().is_some(), "LastModified present");
+
+    // The copy is a real browsable file, byte-for-byte the source.
+    let dst_disk = std::fs::read(server.object_path("bkt", "dst.bin")).expect("dst file exists");
+    assert_eq!(dst_disk, data, "dst on-disk bytes cmp-clean against source");
+
+    // GET returns the source bytes and the same ETag.
+    let got = client
+        .get_object()
+        .bucket("bkt")
+        .key("dst.bin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.e_tag(), Some(src_etag.as_str()));
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&body[..], &data[..]);
+
+    // No temp files left after the staged copy.
+    let leftovers: Vec<_> = std::fs::read_dir(server.datadir.tmp_dir())
+        .unwrap()
+        .collect();
+    assert!(leftovers.is_empty(), "no temp files left after copy rename");
+}
+
+#[tokio::test]
+async fn copy_object_source_key_missing_is_no_such_key() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    let err = client
+        .copy_object()
+        .bucket("bkt")
+        .key("dst")
+        .copy_source("bkt/does-not-exist")
+        .send()
+        .await
+        .expect_err("missing source key");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchKey"));
+}
+
+#[tokio::test]
+async fn copy_object_source_bucket_missing_is_no_such_bucket() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    let err = client
+        .copy_object()
+        .bucket("bkt")
+        .key("dst")
+        .copy_source("no-bucket/k")
+        .send()
+        .await
+        .expect_err("missing source bucket");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchBucket"));
+}
+
+#[tokio::test]
+async fn copy_object_dest_bucket_missing_is_no_such_bucket() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    client
+        .put_object()
+        .bucket("bkt")
+        .key("src")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let err = client
+        .copy_object()
+        .bucket("ghost")
+        .key("dst")
+        .copy_source("bkt/src")
+        .send()
+        .await
+        .expect_err("missing dest bucket");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchBucket"));
+    // No partial file left in a (nonexistent) dest bucket dir.
+    assert!(!server.object_path("ghost", "dst").exists());
+}
+
+#[tokio::test]
+async fn copy_object_copy_directive_carries_source_metadata() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    client
+        .put_object()
+        .bucket("bkt")
+        .key("src")
+        .content_type("application/json")
+        .metadata("team", "x")
+        .body(ByteStream::from_static(b"{}"))
+        .send()
+        .await
+        .unwrap();
+
+    // Default directive (COPY) carries content-type and user metadata.
+    client
+        .copy_object()
+        .bucket("bkt")
+        .key("dst")
+        .copy_source("bkt/src")
+        .send()
+        .await
+        .unwrap();
+
+    let head = client
+        .head_object()
+        .bucket("bkt")
+        .key("dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_type(), Some("application/json"));
+    assert_eq!(
+        head.metadata().unwrap().get("team").map(String::as_str),
+        Some("x")
+    );
+}
+
+#[tokio::test]
+async fn copy_object_replace_directive_takes_request_metadata() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::MetadataDirective;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    client
+        .put_object()
+        .bucket("bkt")
+        .key("src")
+        .content_type("application/json")
+        .metadata("team", "x")
+        .body(ByteStream::from_static(b"payload-bytes"))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .bucket("bkt")
+        .key("dst")
+        .copy_source("bkt/src")
+        .metadata_directive(MetadataDirective::Replace)
+        .content_type("text/plain")
+        .metadata("v", "2")
+        .send()
+        .await
+        .unwrap();
+
+    let head = client
+        .head_object()
+        .bucket("bkt")
+        .key("dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.content_type(),
+        Some("text/plain"),
+        "content-type from request"
+    );
+    let md = head.metadata().unwrap();
+    assert_eq!(
+        md.get("v").map(String::as_str),
+        Some("2"),
+        "metadata from request"
+    );
+    assert!(
+        !md.contains_key("team"),
+        "source metadata not carried on REPLACE"
+    );
+    // Bytes still copied.
+    assert_eq!(
+        std::fs::read(server.object_path("bkt", "dst")).unwrap(),
+        b"payload-bytes"
+    );
+}
+
+#[tokio::test]
+async fn copy_object_same_key_replace_is_metadata_only() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::MetadataDirective;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    let original = b"the original object bytes must be untouched".to_vec();
+    client
+        .put_object()
+        .bucket("bkt")
+        .key("k")
+        .content_type("application/octet-stream")
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .bucket("bkt")
+        .key("k")
+        .copy_source("bkt/k")
+        .metadata_directive(MetadataDirective::Replace)
+        .content_type("text/plain")
+        .metadata("v", "2")
+        .send()
+        .await
+        .expect("same-key REPLACE is legal");
+
+    let head = client
+        .head_object()
+        .bucket("bkt")
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_type(), Some("text/plain"));
+    assert_eq!(
+        head.metadata().unwrap().get("v").map(String::as_str),
+        Some("2")
+    );
+    // Bytes untouched by the metadata-only update.
+    assert_eq!(
+        std::fs::read(server.object_path("bkt", "k")).unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn copy_object_same_key_copy_is_invalid_request() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    client
+        .put_object()
+        .bucket("bkt")
+        .key("k")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let err = client
+        .copy_object()
+        .bucket("bkt")
+        .key("k")
+        .copy_source("bkt/k")
+        .send()
+        .await
+        .expect_err("self-copy with default directive is illegal");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidRequest")
+    );
+}
+
+// --- DeleteObjects (batch, Phase 4) ----------------------------------------
+
+async fn put_bytes(client: &aws_sdk_s3::Client, bucket: &str, key: &str, body: &'static [u8]) {
+    use aws_sdk_s3::primitives::ByteStream;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap();
+}
+
+fn object_id(key: &str) -> aws_sdk_s3::types::ObjectIdentifier {
+    aws_sdk_s3::types::ObjectIdentifier::builder()
+        .key(key)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_objects_removes_rows_and_files_and_lists_all() {
+    use aws_sdk_s3::types::Delete;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    for k in ["k1", "k2", "k3"] {
+        put_bytes(&client, "bkt", k, b"data").await;
+    }
+
+    let del = Delete::builder()
+        .objects(object_id("k1"))
+        .objects(object_id("k2"))
+        .objects(object_id("k3"))
+        .build()
+        .unwrap();
+    let out = client
+        .delete_objects()
+        .bucket("bkt")
+        .delete(del)
+        .send()
+        .await
+        .expect("delete-objects 200");
+
+    // Every requested key is echoed under Deleted.
+    let mut deleted: Vec<&str> = out.deleted().iter().filter_map(|d| d.key()).collect();
+    deleted.sort();
+    assert_eq!(deleted, ["k1", "k2", "k3"]);
+    assert!(out.errors().is_empty(), "no per-key errors");
+
+    // Files gone on disk.
+    for k in ["k1", "k2", "k3"] {
+        assert!(!server.object_path("bkt", k).exists(), "{k} unlinked");
+    }
+    // And gone from listing.
+    let list = client.list_objects_v2().bucket("bkt").send().await.unwrap();
+    assert!(
+        list.contents().is_empty(),
+        "listing empty after batch delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_objects_is_idempotent_for_missing_keys() {
+    use aws_sdk_s3::types::Delete;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    put_bytes(&client, "bkt", "real", b"x").await;
+
+    let del = Delete::builder()
+        .objects(object_id("real"))
+        .objects(object_id("ghost"))
+        .build()
+        .unwrap();
+    let out = client
+        .delete_objects()
+        .bucket("bkt")
+        .delete(del)
+        .send()
+        .await
+        .expect("delete-objects 200 even with a never-existed key");
+    let mut deleted: Vec<&str> = out.deleted().iter().filter_map(|d| d.key()).collect();
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        ["ghost", "real"],
+        "missing key reported deleted too"
+    );
+    assert!(out.errors().is_empty());
+}
+
+#[tokio::test]
+async fn delete_objects_quiet_mode_returns_no_deleted_entries() {
+    use aws_sdk_s3::types::Delete;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    for k in ["k1", "k2"] {
+        put_bytes(&client, "bkt", k, b"x").await;
+    }
+
+    let del = Delete::builder()
+        .objects(object_id("k1"))
+        .objects(object_id("k2"))
+        .quiet(true)
+        .build()
+        .unwrap();
+    let out = client
+        .delete_objects()
+        .bucket("bkt")
+        .delete(del)
+        .send()
+        .await
+        .expect("quiet delete-objects 200");
+    assert!(out.deleted().is_empty(), "quiet mode: no Deleted entries");
+    assert!(
+        out.errors().is_empty(),
+        "quiet mode: no Errors on full success"
+    );
+    // Keys still removed from disk.
+    for k in ["k1", "k2"] {
+        assert!(
+            !server.object_path("bkt", k).exists(),
+            "{k} removed in quiet mode"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_objects_on_missing_bucket_is_no_such_bucket() {
+    use aws_sdk_s3::types::Delete;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let del = Delete::builder().objects(object_id("k")).build().unwrap();
+    let err = client
+        .delete_objects()
+        .bucket("ghost")
+        .delete(del)
+        .send()
+        .await
+        .expect_err("delete-objects on a missing bucket");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchBucket"));
+}
+
+#[tokio::test]
+async fn delete_objects_over_1000_is_invalid_request() {
+    use aws_sdk_s3::types::Delete;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "bkt").await;
+    let mut builder = Delete::builder();
+    for i in 0..1001 {
+        builder = builder.objects(object_id(&format!("k{i}")));
+    }
+    let del = builder.build().unwrap();
+    let err = client
+        .delete_objects()
+        .bucket("bkt")
+        .delete(del)
+        .send()
+        .await
+        .expect_err("more than 1000 keys must be rejected");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidRequest")
+    );
+}

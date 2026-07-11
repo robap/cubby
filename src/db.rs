@@ -145,6 +145,26 @@ impl Db {
         })
     }
 
+    /// Delete every listed key for a bucket in one transaction. Idempotent per
+    /// key (a never-existed key removes zero rows), matching the batch
+    /// DeleteObjects contract; the caller unlinks the files afterward. An empty
+    /// list is a no-op.
+    pub fn delete_objects(&self, bucket: &str, keys: &[String]) -> rusqlite::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare("DELETE FROM objects WHERE bucket = ?1 AND key = ?2")?;
+                for key in keys {
+                    stmt.execute(rusqlite::params![bucket, key])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
     /// One index-backed page of a bucket's objects, in ascending key order.
     ///
     /// This is the sole seek primitive ListObjectsV2 stands on. The `objects`
@@ -640,6 +660,44 @@ mod tests {
         let _ = Db::open(&path).unwrap();
         // Second open must not fail on existing tables.
         let _ = Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_objects_removes_all_given_keys_in_one_call() {
+        let (_tmp, db) = open_temp();
+        for k in ["k1", "k2", "k3", "keep"] {
+            seed(&db, "b", k);
+        }
+        // A never-existed key in the batch is a harmless no-op (idempotent).
+        db.delete_objects(
+            "b",
+            &["k1".into(), "k2".into(), "k3".into(), "ghost".into()],
+        )
+        .unwrap();
+        assert!(db.get_object("b", "k1").unwrap().is_none());
+        assert!(db.get_object("b", "k2").unwrap().is_none());
+        assert!(db.get_object("b", "k3").unwrap().is_none());
+        // Unlisted keys survive.
+        assert!(db.get_object("b", "keep").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_objects_empty_list_is_noop() {
+        let (_tmp, db) = open_temp();
+        seed(&db, "b", "keep");
+        db.delete_objects("b", &[]).unwrap();
+        assert!(db.get_object("b", "keep").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_objects_is_scoped_to_the_bucket() {
+        let (_tmp, db) = open_temp();
+        seed(&db, "a", "shared");
+        seed(&db, "b", "shared");
+        db.delete_objects("b", &["shared".into()]).unwrap();
+        // Same key in another bucket is untouched.
+        assert!(db.get_object("a", "shared").unwrap().is_some());
+        assert!(db.get_object("b", "shared").unwrap().is_none());
     }
 
     #[test]

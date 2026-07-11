@@ -128,6 +128,73 @@ sync`) compare ETags correctly instead of re-transferring.
 The 5MiB-minimum-part-size rule is **deliberately not enforced** (dev-tool
 ergonomics — tests can drive the whole lifecycle with tiny parts).
 
+## Presigned URLs, CopyObject & DeleteObjects (Phase 4)
+
+### Presigned URLs (query-string auth)
+
+An SDK can sign a short-lived URL that carries the whole SigV4 signature in the
+query string (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Signature`,
+`X-Amz-Expires`, …), so a browser, a `curl`, or a service with **no
+credentials** can `GET` or `PUT` a single object. buckit validates these exactly
+like header-signed requests — nothing to enable.
+
+```console
+$ aws --endpoint-url http://127.0.0.1:9000 s3 presign s3://uploads/report.pdf
+http://127.0.0.1:9000/uploads/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&…&X-Amz-Signature=…
+
+$ curl "$URL" -o report.pdf        # no credentials needed
+```
+
+boto3 (`generate_presigned_url("get_object" | "put_object", …)`) and aws-sdk-js
+v3 (`@aws-sdk/s3-request-presigner` `getSignedUrl`) generate the same URLs.
+Create the boto3 client with `Config(signature_version="s3v4")` — boto3 defaults
+a presigned **PUT** to the legacy SigV2 query scheme, which buckit (like MinIO)
+does not accept; SigV4 is what modern apps use. A presigned `PUT` uses
+`UNSIGNED-PAYLOAD`; the body still streams through the
+normal write path and gets a correct content-MD5 ETag. A URL fetched after its
+`X-Amz-Expires` window lapses is `403 AccessDenied` ("Request has expired"); a
+URL with a tampered path or query is `403 SignatureDoesNotMatch`.
+
+> **Docker gotcha — the host is part of the signature.** SigV4 signs the `Host`
+> header, so a URL signed for `localhost:9000` will fail with
+> `SignatureDoesNotMatch` if it is replayed against a different host:port — the
+> classic Docker-Compose case where one container signs for `localhost` but the
+> URL is used against the `buckit` service name (or vice versa). This is correct
+> S3 behavior, not a bug: sign the URL for the **same** host the client will use
+> to fetch it.
+
+### CopyObject
+
+`PUT /<destbucket>/<destkey>` with `x-amz-copy-source: /<srcbucket>/<srckey>`
+(`s3.copy`, `s3.copy_object`, `aws s3 cp s3://a s3://b`) copies an existing
+object's bytes into a new key. The bytes are streamed through the same
+`.tmp/`→fsync→rename→row path as PutObject, so the copy is one real browsable
+file (`cmp` against the source is clean).
+
+- **ETag is preserved verbatim** — a single-part source keeps its hex MD5, a
+  multipart source keeps its composite `-N` ETag (no re-hash).
+- **`x-amz-metadata-directive: COPY`** (default) carries the source's
+  content-type and user metadata onto the copy; **`REPLACE`** takes them from
+  the request instead (content-type defaulting to `application/octet-stream`).
+- **source == dest** with `REPLACE` is the metadata-only update idiom: the row's
+  content-type/metadata are rewritten and the bytes are left untouched. With the
+  default (`COPY`) directive a self-copy is `400 InvalidRequest`, matching S3.
+- Errors, all before any bytes move: missing source bucket → `NoSuchBucket`,
+  missing source key → `NoSuchKey`, missing destination bucket → `NoSuchBucket`.
+  A non-`<bucket>/<key>` copy-source (access-point/Outpost ARN) →
+  `NotImplemented`.
+
+### DeleteObjects (batch)
+
+`POST /<bucket>?delete` with an XML `<Delete>` body deletes up to **1000** keys
+in one request (`s3.delete_objects`, and the engine behind `aws s3 rm
+--recursive` / `rclone delete`). Each key follows the Phase 1 row-first-then-
+unlink path in a single transaction. Deletion is **idempotent** — a key with no
+object still reports as deleted, matching S3. A batch over 1000 keys is
+`400 InvalidRequest`; a batch against a missing bucket is `404 NoSuchBucket`
+(the whole request fails). `Quiet: true` returns an empty result on full success
+(only errors would appear); `versionId` on an entry is ignored.
+
 ### Addressing
 
 Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
@@ -135,9 +202,12 @@ Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
 
 ### Not yet implemented
 
-Presigned URLs and CopyObject/DeleteObjects (Phase 4), and the web UI at `/_/`
-(Phase 5, currently a `501` placeholder). ListMultipartUploads and
-UploadPartCopy are not implemented (`NotImplemented`).
+The web UI at `/_/` (Phase 5, currently a `501` placeholder).
+ListMultipartUploads and UploadPartCopy (`x-amz-copy-source` on an UploadPart)
+are not implemented (`NotImplemented`). Copy-source conditional headers
+(`x-amz-copy-source-if-*`) are parsed and ignored. Browser cross-origin access
+to the S3 API needs CORS (`--cors`), a later flag; a presigned URL still works
+from a browser, only cross-origin `fetch()` is gated.
 
 ## Storage model
 
