@@ -17,6 +17,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 md-5 = "0.10"
+getrandom = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 percent-encoding = "2"
 base64 = "0.22"

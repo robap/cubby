@@ -221,6 +221,168 @@ impl Db {
             rows.collect()
         })
     }
+
+    // --- Multipart uploads --------------------------------------------------
+
+    /// Record a new in-flight multipart upload. The `upload_id` is the primary
+    /// key and also names the `.multipart/<upload_id>/` staging directory.
+    pub fn create_multipart(&self, row: &MultipartRow) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, content_type, metadata, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    row.upload_id,
+                    row.bucket,
+                    row.key,
+                    row.content_type,
+                    row.metadata,
+                    row.started_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Fetch an in-flight upload's row, or `None` if the id is unknown (never
+    /// created, or already completed/aborted).
+    pub fn get_multipart(&self, upload_id: &str) -> rusqlite::Result<Option<MultipartRow>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT upload_id, bucket, key, content_type, metadata, started_at \
+                 FROM multipart_uploads WHERE upload_id = ?1",
+                [upload_id],
+                |r| {
+                    Ok(MultipartRow {
+                        upload_id: r.get(0)?,
+                        bucket: r.get(1)?,
+                        key: r.get(2)?,
+                        content_type: r.get(3)?,
+                        metadata: r.get(4)?,
+                        started_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Record (or replace) an uploaded part. Re-uploading a part number
+    /// overwrites its recorded size and ETag (last write wins).
+    pub fn put_part(
+        &self,
+        upload_id: &str,
+        part_number: i32,
+        size: i64,
+        etag: &str,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO multipart_parts \
+                 (upload_id, part_number, size, etag) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![upload_id, part_number, size, etag],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// All recorded parts of an upload, ascending by part number. Used by
+    /// Complete to validate the client's list and assemble.
+    pub fn all_parts(&self, upload_id: &str) -> rusqlite::Result<Vec<PartRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT part_number, size, etag FROM multipart_parts \
+                 WHERE upload_id = ?1 ORDER BY part_number",
+            )?;
+            let rows = stmt.query_map([upload_id], part_row_from)?;
+            rows.collect()
+        })
+    }
+
+    /// One ascending page of parts strictly after `after` (the
+    /// `part-number-marker`), at most `limit` rows. `after = None` starts at the
+    /// first part; `limit <= 0` yields an empty vec.
+    pub fn list_parts(
+        &self,
+        upload_id: &str,
+        after: Option<i32>,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<PartRow>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let after = after.unwrap_or(0);
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT part_number, size, etag FROM multipart_parts \
+                 WHERE upload_id = ?1 AND part_number > ?2 \
+                 ORDER BY part_number LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![upload_id, after, limit], part_row_from)?;
+            rows.collect()
+        })
+    }
+
+    /// Atomically finish an upload: insert the assembled object row and delete
+    /// the multipart bookkeeping (parts + upload) in one transaction. The bytes
+    /// are already fsync'd and renamed into place, so the object row is the
+    /// authoritative record; running it with the deletes in one txn means a
+    /// completed upload never leaves half its rows behind.
+    pub fn complete_multipart(&self, upload_id: &str, object: &ObjectRow) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO objects \
+                 (bucket, key, size, etag, content_type, last_modified, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    object.bucket,
+                    object.key,
+                    object.size,
+                    object.etag,
+                    object.content_type,
+                    object.last_modified,
+                    object.metadata,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM multipart_parts WHERE upload_id = ?1",
+                [upload_id],
+            )?;
+            tx.execute(
+                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                [upload_id],
+            )?;
+            tx.commit()
+        })
+    }
+
+    /// Discard an upload (abort): delete its parts and upload row. No object is
+    /// created. Idempotent — deleting an already-gone id removes zero rows.
+    pub fn delete_multipart(&self, upload_id: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM multipart_parts WHERE upload_id = ?1",
+                [upload_id],
+            )?;
+            tx.execute(
+                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                [upload_id],
+            )?;
+            tx.commit()
+        })
+    }
+}
+
+/// Build a [`PartRow`] from a `SELECT part_number, size, etag` row.
+fn part_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<PartRow> {
+    Ok(PartRow {
+        part_number: r.get(0)?,
+        size: r.get(1)?,
+        etag: r.get(2)?,
+    })
 }
 
 /// Build an [`ObjectRow`] from a `SELECT bucket, key, size, etag, content_type,
@@ -261,6 +423,31 @@ pub struct ObjectRow {
     pub metadata: String,
 }
 
+/// A row of the `multipart_uploads` table: an in-flight upload's captured
+/// destination and headers.
+#[derive(Debug, Clone)]
+pub struct MultipartRow {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    /// Content type captured at CreateMultipartUpload (the object gets it).
+    pub content_type: Option<String>,
+    /// User metadata as a JSON object string, captured at Create.
+    pub metadata: String,
+    /// Unix seconds.
+    pub started_at: i64,
+}
+
+/// A row of the `multipart_parts` table: one uploaded part.
+#[derive(Debug, Clone)]
+pub struct PartRow {
+    pub part_number: i32,
+    /// Size in bytes.
+    pub size: i64,
+    /// Hex MD5 (unquoted) of this part's bytes.
+    pub etag: String,
+}
+
 /// Result of [`Db::try_delete_bucket`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteBucketOutcome {
@@ -288,6 +475,23 @@ CREATE TABLE IF NOT EXISTS objects (
     last_modified INTEGER NOT NULL,
     metadata      TEXT    NOT NULL DEFAULT '{}',
     PRIMARY KEY (bucket, key)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+    upload_id    TEXT    PRIMARY KEY,
+    bucket       TEXT    NOT NULL,
+    key          TEXT    NOT NULL,
+    content_type TEXT,
+    metadata     TEXT    NOT NULL DEFAULT '{}',
+    started_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS multipart_parts (
+    upload_id   TEXT    NOT NULL,
+    part_number INTEGER NOT NULL,
+    size        INTEGER NOT NULL,
+    etag        TEXT    NOT NULL,
+    PRIMARY KEY (upload_id, part_number)
 ) WITHOUT ROWID;
 ";
 
@@ -436,5 +640,132 @@ mod tests {
         let _ = Db::open(&path).unwrap();
         // Second open must not fail on existing tables.
         let _ = Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn multipart_tables_exist() {
+        let (_tmp, db) = open_temp();
+        let names: Vec<String> = db
+            .with_conn(|c| {
+                let mut stmt =
+                    c.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert!(names.contains(&"multipart_uploads".to_string()));
+        assert!(names.contains(&"multipart_parts".to_string()));
+    }
+
+    fn seed_upload(db: &Db, upload_id: &str) {
+        db.create_multipart(&MultipartRow {
+            upload_id: upload_id.to_owned(),
+            bucket: "b".to_owned(),
+            key: "big.bin".to_owned(),
+            content_type: Some("text/plain".to_owned()),
+            metadata: r#"{"x":"y"}"#.to_owned(),
+            started_at: 123,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn get_multipart_returns_captured_content_type_and_metadata() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        let row = db.get_multipart("u1").unwrap().expect("upload row exists");
+        assert_eq!(row.bucket, "b");
+        assert_eq!(row.key, "big.bin");
+        assert_eq!(row.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(row.metadata, r#"{"x":"y"}"#);
+        assert_eq!(row.started_at, 123);
+        // Unknown id → None.
+        assert!(db.get_multipart("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn put_part_replaces_on_reupload() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        db.put_part("u1", 1, 10, "aaaa").unwrap();
+        db.put_part("u1", 1, 20, "bbbb").unwrap(); // re-upload same number
+        let parts = db.all_parts("u1").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].size, 20);
+        assert_eq!(parts[0].etag, "bbbb");
+    }
+
+    #[test]
+    fn all_parts_is_ascending() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        db.put_part("u1", 5, 5, "e5").unwrap();
+        db.put_part("u1", 1, 1, "e1").unwrap();
+        db.put_part("u1", 9, 9, "e9").unwrap();
+        let nums: Vec<i32> = db
+            .all_parts("u1")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.part_number)
+            .collect();
+        assert_eq!(nums, [1, 5, 9]);
+    }
+
+    #[test]
+    fn list_parts_paginates_strictly_after_marker() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        for n in 1..=3 {
+            db.put_part("u1", n, n as i64, "e").unwrap();
+        }
+        // First page of one part.
+        let page1 = db.list_parts("u1", None, 1).unwrap();
+        assert_eq!(page1.iter().map(|p| p.part_number).collect::<Vec<_>>(), [1]);
+        // Resume strictly after part 1 → parts 2 and 3.
+        let page2 = db.list_parts("u1", Some(1), 10).unwrap();
+        assert_eq!(
+            page2.iter().map(|p| p.part_number).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        // limit <= 0 → empty.
+        assert!(db.list_parts("u1", None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn complete_multipart_is_atomic_swap() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        db.put_part("u1", 1, 10, "e1").unwrap();
+        db.put_part("u1", 2, 20, "e2").unwrap();
+
+        let object = ObjectRow {
+            bucket: "b".to_owned(),
+            key: "big.bin".to_owned(),
+            size: 30,
+            etag: "deadbeef-2".to_owned(),
+            content_type: Some("text/plain".to_owned()),
+            last_modified: 999,
+            metadata: "{}".to_owned(),
+        };
+        db.complete_multipart("u1", &object).unwrap();
+
+        // Object row created…
+        let obj = db.get_object("b", "big.bin").unwrap().expect("object row");
+        assert_eq!(obj.size, 30);
+        assert_eq!(obj.etag, "deadbeef-2");
+        // …and all multipart bookkeeping gone.
+        assert!(db.get_multipart("u1").unwrap().is_none());
+        assert!(db.all_parts("u1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_multipart_removes_rows_without_object() {
+        let (_tmp, db) = open_temp();
+        seed_upload(&db, "u1");
+        db.put_part("u1", 1, 10, "e1").unwrap();
+        db.delete_multipart("u1").unwrap();
+        assert!(db.get_multipart("u1").unwrap().is_none());
+        assert!(db.all_parts("u1").unwrap().is_empty());
+        assert!(db.get_object("b", "big.bin").unwrap().is_none());
     }
 }

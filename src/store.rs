@@ -10,18 +10,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use s3s::dto::{
-    Bucket, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
     DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag, EncodingType, GetObjectInput,
     GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
     ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, Metadata, Object, ObjectStorageClass, Owner, PutObjectInput,
-    PutObjectOutput, StreamingBlob, Timestamp,
+    ListObjectsV2Output, ListPartsInput, ListPartsOutput, Metadata, Object, ObjectStorageClass,
+    Owner, Part, PutObjectInput, PutObjectOutput, StorageClass, StreamingBlob, Timestamp,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use crate::datadir::DataDir;
-use crate::db::{Db, DeleteBucketOutcome, ObjectRow};
+use crate::db::{Db, DeleteBucketOutcome, MultipartRow, ObjectRow, PartRow};
 use crate::listing::{self, ListPage, ListParams};
+use crate::multipart::{self, CompleteError, RecordedPart, SubmittedPart};
 
 /// Monotonic counter for unique temp-file names within this process.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +95,59 @@ impl Store {
             return Err(err);
         }
         Ok((temp_path, size, hex::encode(hasher.finalize())))
+    }
+
+    /// Filesystem path of one staged part: `.multipart/<upload_id>/<part_number>`.
+    fn part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
+        self.dirs
+            .multipart_dir()
+            .join(upload_id)
+            .join(part_number.to_string())
+    }
+
+    /// Stream-concatenate the given parts (already in ascending order) into a
+    /// fresh temp file in `.tmp/`, `fsync`, and return `(temp_path, total_size)`.
+    /// Parts are copied through `tokio::io::copy` a chunk at a time — a whole
+    /// part (or the assembled object) is never held in memory, the same
+    /// discipline as [`Store::stream_to_temp`]. The temp file is removed on
+    /// error.
+    async fn assemble_parts(
+        &self,
+        upload_id: &str,
+        parts: &[RecordedPart],
+    ) -> S3Result<(PathBuf, i64)> {
+        use tokio::io::AsyncWriteExt;
+
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = self
+            .dirs
+            .tmp_dir()
+            .join(format!("{}-{n}.assemble", std::process::id()));
+        let mut out = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(internal)?;
+
+        let mut total: i64 = 0;
+        let copy_result: S3Result<()> = async {
+            for part in parts {
+                let src = self.part_path(upload_id, part.part_number);
+                let mut input = tokio::fs::File::open(&src).await.map_err(internal)?;
+                total += tokio::io::copy(&mut input, &mut out)
+                    .await
+                    .map_err(internal)? as i64;
+            }
+            out.flush().await.map_err(internal)?;
+            out.sync_all().await.map_err(internal)?; // durability before rename
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = copy_result {
+            drop(out);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
+        Ok((temp_path, total))
     }
 
     /// Pick the right "not found" error when an object row is absent: if the
@@ -194,6 +251,16 @@ fn resolve_max_keys(max_keys: Option<i32>) -> S3Result<usize> {
     match max_keys {
         None => Ok(1000),
         Some(n) if n < 0 => Err(s3_error!(InvalidArgument, "max-keys must be non-negative")),
+        Some(n) => Ok((n as usize).min(1000)),
+    }
+}
+
+/// Apply S3's `max-parts` policy for ListParts: default 1000, cap at 1000,
+/// negative is `400 InvalidArgument`. Mirrors [`resolve_max_keys`].
+fn resolve_max_parts(max_parts: Option<i32>) -> S3Result<usize> {
+    match max_parts {
+        None => Ok(1000),
+        Some(n) if n < 0 => Err(s3_error!(InvalidArgument, "max-parts must be non-negative")),
         Some(n) => Ok((n as usize).min(1000)),
     }
 }
@@ -637,5 +704,289 @@ impl s3s::S3 for Store {
             encoding_type: input.encoding_type,
             ..Default::default()
         }))
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let key = input.key;
+
+        // The bucket must exist before we open an upload against it.
+        let b = bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&b)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
+        }
+
+        let upload_id = multipart::new_upload_id();
+
+        // Staging dir first, then the row: a crash in between leaves an empty
+        // orphan dir with no row — invisible, sweepable like `.tmp/`.
+        let stage = self.dirs.multipart_dir().join(&upload_id);
+        tokio::fs::create_dir_all(&stage).await.map_err(internal)?;
+
+        let metadata =
+            serde_json::to_string(&input.metadata.unwrap_or_default()).map_err(internal)?;
+        let row = MultipartRow {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            content_type: input.content_type,
+            metadata,
+            started_at: unix_now(),
+        };
+        self.db_call(move |db| db.create_multipart(&row)).await?;
+
+        Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        }))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let input = req.input;
+        let upload_id = input.upload_id;
+        let part_number = input.part_number;
+
+        // S3's accepted part-number range.
+        if !(1..=10000).contains(&part_number) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "part number must be in 1..=10000, got {part_number}"
+            ));
+        }
+
+        // The upload must exist (a bogus/expired id is NoSuchUpload).
+        let uid = upload_id.clone();
+        if self
+            .db_call(move |db| db.get_multipart(&uid))
+            .await?
+            .is_none()
+        {
+            return Err(s3_error!(NoSuchUpload, "no such upload: {upload_id}"));
+        }
+
+        // Same streaming/fsync discipline as PutObject: land in `.tmp/`, then
+        // rename atomically into the part's staging slot.
+        let (temp_path, size, etag_hex) = self.stream_to_temp(input.body).await?;
+        let final_path = self.part_path(&upload_id, part_number);
+        if let Some(parent) = final_path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(internal(err));
+            }
+        }
+        if let Err(err) = tokio::fs::rename(&temp_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(internal(err));
+        }
+
+        // Bytes durably in place; record the part (INSERT OR REPLACE = last
+        // write wins on re-upload).
+        let etag = etag_hex.clone();
+        self.db_call(move |db| db.put_part(&upload_id, part_number, size, &etag))
+            .await?;
+
+        Ok(S3Response::new(UploadPartOutput {
+            e_tag: Some(ETag::Strong(etag_hex)),
+            ..Default::default()
+        }))
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let key = input.key;
+        let upload_id = input.upload_id;
+        let max_parts = resolve_max_parts(input.max_parts)?;
+        let marker = input.part_number_marker;
+
+        let uid = upload_id.clone();
+        if self
+            .db_call(move |db| db.get_multipart(&uid))
+            .await?
+            .is_none()
+        {
+            return Err(s3_error!(NoSuchUpload, "no such upload: {upload_id}"));
+        }
+
+        // Fetch one extra row to detect truncation without a second query.
+        let uid = upload_id.clone();
+        let limit = max_parts as i64 + 1;
+        let mut rows = self
+            .db_call(move |db| db.list_parts(&uid, marker, limit))
+            .await?;
+        let is_truncated = rows.len() > max_parts;
+        rows.truncate(max_parts);
+        let next_marker = is_truncated
+            .then(|| rows.last().map(|p| p.part_number))
+            .flatten();
+
+        let started_at = ts_from_unix(unix_now());
+        let parts: Vec<Part> = rows
+            .into_iter()
+            .map(|p| Part {
+                part_number: Some(p.part_number),
+                size: Some(p.size),
+                e_tag: Some(ETag::Strong(p.etag)),
+                last_modified: Some(started_at.clone()),
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+            max_parts: Some(max_parts as i32),
+            part_number_marker: marker,
+            next_part_number_marker: next_marker,
+            is_truncated: Some(is_truncated),
+            parts: (!parts.is_empty()).then_some(parts),
+            ..Default::default()
+        }))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let key = input.key;
+        let upload_id = input.upload_id;
+
+        // Resolve the upload (unknown id → NoSuchUpload).
+        let uid = upload_id.clone();
+        let Some(upload) = self.db_call(move |db| db.get_multipart(&uid)).await? else {
+            return Err(s3_error!(NoSuchUpload, "no such upload: {upload_id}"));
+        };
+
+        // The client's submitted part list, in the order given.
+        let submitted: Vec<SubmittedPart> = input
+            .multipart_upload
+            .and_then(|m| m.parts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| SubmittedPart {
+                part_number: p.part_number.unwrap_or(0),
+                etag: p.e_tag.map(|e| e.into_value()).unwrap_or_default(),
+            })
+            .collect();
+
+        // All recorded parts, then validate the submission (all before assembly).
+        let uid = upload_id.clone();
+        let recorded_rows = self.db_call(move |db| db.all_parts(&uid)).await?;
+        let recorded: Vec<RecordedPart> = recorded_rows
+            .into_iter()
+            .map(|p: PartRow| RecordedPart {
+                part_number: p.part_number,
+                size: p.size,
+                etag_hex: p.etag,
+            })
+            .collect();
+
+        let selected =
+            multipart::validate_complete(&submitted, &recorded).map_err(|e| match e {
+                CompleteError::Empty => s3_error!(InvalidRequest, "part list must not be empty"),
+                CompleteError::OutOfOrder => {
+                    s3_error!(InvalidPartOrder, "parts must be in ascending order")
+                }
+                CompleteError::InvalidPart { part_number } => {
+                    s3_error!(InvalidPart, "invalid or missing part {part_number}")
+                }
+            })?;
+
+        // Composite ETag from the recorded hex digests — no data re-read.
+        let hexes: Vec<&str> = selected.iter().map(|p| p.etag_hex.as_str()).collect();
+        let composite = multipart::composite_etag(&hexes);
+
+        // Stream-assemble the parts into `.tmp/`, then atomically rename into
+        // `buckets/<b>/<key>` (parents created). A crash between rename and the
+        // row insert leaves a harmless orphan file, exactly like PutObject.
+        let (temp_path, total_size) = self.assemble_parts(&upload_id, &selected).await?;
+        let final_path = self
+            .dirs
+            .bucket_dir(&bucket)
+            .join(crate::keypath::key_to_relpath(&key));
+        if let Some(parent) = final_path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(internal(err));
+            }
+        }
+        if let Err(err) = tokio::fs::rename(&temp_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(internal(err));
+        }
+
+        // Write the object row and drop the multipart bookkeeping in one txn.
+        let object = ObjectRow {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            size: total_size,
+            etag: composite.clone(),
+            content_type: upload
+                .content_type
+                .or_else(|| Some(DEFAULT_CONTENT_TYPE.to_owned())),
+            last_modified: unix_now(),
+            metadata: upload.metadata,
+        };
+        let uid = upload_id.clone();
+        self.db_call(move |db| db.complete_multipart(&uid, &object))
+            .await?;
+
+        // Staging tree no longer referenced; remove it (best-effort — an orphan
+        // dir is invisible and sweepable).
+        let stage = self.dirs.multipart_dir().join(&upload_id);
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+
+        Ok(S3Response::new(CompleteMultipartUploadOutput {
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            e_tag: Some(ETag::Strong(composite)),
+            location: Some(format!("/{bucket}/{key}")),
+            ..Default::default()
+        }))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let upload_id = req.input.upload_id;
+
+        // A live id → success; an already-gone one → NoSuchUpload.
+        let uid = upload_id.clone();
+        if self
+            .db_call(move |db| db.get_multipart(&uid))
+            .await?
+            .is_none()
+        {
+            return Err(s3_error!(NoSuchUpload, "no such upload: {upload_id}"));
+        }
+
+        // Rows first (source of truth), then the staging tree.
+        let uid = upload_id.clone();
+        self.db_call(move |db| db.delete_multipart(&uid)).await?;
+        let stage = self.dirs.multipart_dir().join(&upload_id);
+        if let Err(err) = tokio::fs::remove_dir_all(&stage).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(internal(err));
+            }
+        }
+
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 }

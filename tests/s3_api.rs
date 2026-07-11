@@ -1094,3 +1094,471 @@ async fn raw_http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
         .to_owned();
     (status, body)
 }
+
+// =====================================================================
+// Multipart (Phase 3)
+// =====================================================================
+
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+/// Upload one part and return the ETag the server assigned it.
+async fn upload_part(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    body: &[u8],
+) -> String {
+    use aws_sdk_s3::primitives::ByteStream;
+    let out = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .expect("upload-part 200");
+    out.e_tag().expect("part etag present").to_owned()
+}
+
+/// Create an upload and return its id.
+async fn create_upload(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> String {
+    client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("create-multipart 200")
+        .upload_id()
+        .expect("upload id")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn create_multipart_returns_upload_id() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+
+    let out = client
+        .create_multipart_upload()
+        .bucket("mpbucket")
+        .key("big.bin")
+        .send()
+        .await
+        .expect("create-multipart 200");
+    assert!(
+        out.upload_id().map(|s| !s.is_empty()).unwrap_or(false),
+        "non-empty upload id"
+    );
+    assert_eq!(out.bucket(), Some("mpbucket"));
+    assert_eq!(out.key(), Some("big.bin"));
+    // Staging dir exists on disk.
+    let stage = server
+        .datadir
+        .multipart_dir()
+        .join(out.upload_id().unwrap());
+    assert!(stage.is_dir(), "staging dir created");
+}
+
+#[tokio::test]
+async fn create_multipart_on_missing_bucket_is_no_such_bucket() {
+    let server = TestServer::spawn().await;
+    let err = server
+        .client()
+        .create_multipart_upload()
+        .bucket("nope")
+        .key("k")
+        .send()
+        .await
+        .expect_err("must fail on absent bucket");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchBucket"));
+}
+
+#[tokio::test]
+async fn upload_part_writes_bytes_and_replaces_on_reupload() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let uid = create_upload(&client, "mpbucket", "big.bin").await;
+
+    let p1 = b"AAAAAAAAAA".to_vec();
+    let p2 = b"BBBBBBBBBBBBBBBBBBBB".to_vec();
+    let e1 = upload_part(&client, "mpbucket", "big.bin", &uid, 1, &p1).await;
+    let e2 = upload_part(&client, "mpbucket", "big.bin", &uid, 2, &p2).await;
+    assert_eq!(e1, format!("\"{}\"", md5_hex(&p1)));
+    assert_eq!(e2, format!("\"{}\"", md5_hex(&p2)));
+
+    // Part files exist on disk with the right bytes.
+    let stage = server.datadir.multipart_dir().join(&uid);
+    assert_eq!(std::fs::read(stage.join("1")).unwrap(), p1);
+    assert_eq!(std::fs::read(stage.join("2")).unwrap(), p2);
+
+    // Re-uploading part 1 overwrites its bytes and ETag.
+    let p1b = b"ZZZZ".to_vec();
+    let e1b = upload_part(&client, "mpbucket", "big.bin", &uid, 1, &p1b).await;
+    assert_eq!(e1b, format!("\"{}\"", md5_hex(&p1b)));
+    assert_eq!(std::fs::read(stage.join("1")).unwrap(), p1b);
+}
+
+#[tokio::test]
+async fn upload_part_bogus_upload_id_is_no_such_upload() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let err = client
+        .upload_part()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id("deadbeefdeadbeefdeadbeefdeadbeef")
+        .part_number(1)
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .expect_err("bogus upload id must fail");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchUpload"));
+}
+
+#[tokio::test]
+async fn upload_part_out_of_range_number_is_invalid_argument() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let uid = create_upload(&client, "mpbucket", "k").await;
+    let err = client
+        .upload_part()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .part_number(10001)
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .expect_err("part number 10001 must be rejected");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidArgument")
+    );
+}
+
+#[tokio::test]
+async fn list_parts_ascending_with_pagination() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let uid = create_upload(&client, "mpbucket", "k").await;
+    let p1 = b"AAAAAAAAAA".to_vec(); // 10 bytes
+    let p2 = b"BBBBBBBBBBBBBBBBBBBB".to_vec(); // 20 bytes
+    let e1 = upload_part(&client, "mpbucket", "k", &uid, 1, &p1).await;
+    let e2 = upload_part(&client, "mpbucket", "k", &uid, 2, &p2).await;
+
+    // Full listing: both parts ascending with correct sizes and ETags.
+    let out = client
+        .list_parts()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .send()
+        .await
+        .expect("list-parts 200");
+    let parts = out.parts();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].part_number(), Some(1));
+    assert_eq!(parts[0].size(), Some(10));
+    assert_eq!(parts[0].e_tag(), Some(e1.as_str()));
+    assert_eq!(parts[1].part_number(), Some(2));
+    assert_eq!(parts[1].size(), Some(20));
+    assert_eq!(parts[1].e_tag(), Some(e2.as_str()));
+
+    // A max-parts=1 page is truncated; its marker resumes at part 2.
+    let page1 = client
+        .list_parts()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .max_parts(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page1.is_truncated(), Some(true));
+    assert_eq!(page1.parts().len(), 1);
+    assert_eq!(page1.next_part_number_marker(), Some("1"));
+
+    let page2 = client
+        .list_parts()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .part_number_marker("1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page2.parts().len(), 1);
+    assert_eq!(page2.parts()[0].part_number(), Some(2));
+}
+
+#[tokio::test]
+async fn list_parts_bogus_upload_id_is_no_such_upload() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let err = client
+        .list_parts()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id("deadbeefdeadbeefdeadbeefdeadbeef")
+        .send()
+        .await
+        .expect_err("bogus upload id must fail");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchUpload"));
+}
+
+/// Drive a full 3-part upload and complete it; return the composite ETag.
+async fn complete_three_parts(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    p1: &[u8],
+    p2: &[u8],
+    p3: &[u8],
+) -> String {
+    let uid = create_upload(client, bucket, key).await; // bucket passed by caller
+    let e1 = upload_part(client, bucket, key, &uid, 1, p1).await;
+    let e2 = upload_part(client, bucket, key, &uid, 2, p2).await;
+    let e3 = upload_part(client, bucket, key, &uid, 3, p3).await;
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).e_tag(e1).build())
+        .parts(CompletedPart::builder().part_number(2).e_tag(e2).build())
+        .parts(CompletedPart::builder().part_number(3).e_tag(e3).build())
+        .build();
+    let out = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&uid)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("complete 200");
+    out.e_tag().expect("composite etag").to_owned()
+}
+
+#[tokio::test]
+async fn complete_assembles_one_real_file_with_composite_etag() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+
+    let p1 = vec![b'a'; 100];
+    let p2 = vec![b'b'; 200];
+    let p3 = vec![b'c'; 50];
+    let etag = complete_three_parts(&client, "mpbucket", "big.bin", &p1, &p2, &p3).await;
+
+    // Composite ETag matches the md5-of-md5s formula, suffixed -3.
+    let expected = {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(Md5::digest(&p1));
+        h.update(Md5::digest(&p2));
+        h.update(Md5::digest(&p3));
+        format!("\"{}-3\"", hex::encode(h.finalize()))
+    };
+    assert_eq!(etag, expected);
+
+    // get_object bytes == part1+part2+part3.
+    let mut concat = p1.clone();
+    concat.extend_from_slice(&p2);
+    concat.extend_from_slice(&p3);
+    let got = client
+        .get_object()
+        .bucket("mpbucket")
+        .key("big.bin")
+        .send()
+        .await
+        .unwrap();
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), concat.as_slice());
+
+    // head_object size == sum of parts, and carries the composite etag.
+    let head = client
+        .head_object()
+        .bucket("mpbucket")
+        .key("big.bin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(350));
+    assert_eq!(head.e_tag(), Some(etag.as_str()));
+
+    // On-disk file cmps clean against the concatenation.
+    let on_disk = std::fs::read(server.object_path("mpbucket", "big.bin")).unwrap();
+    assert_eq!(on_disk, concat);
+
+    // Staging tree is gone.
+    let entries: Vec<_> = std::fs::read_dir(server.datadir.multipart_dir())
+        .unwrap()
+        .collect();
+    assert!(entries.is_empty(), "no staging dirs left after complete");
+}
+
+#[tokio::test]
+async fn complete_overwrites_existing_key_last_writer_wins() {
+    use aws_sdk_s3::primitives::ByteStream;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+
+    // Single-PUT object at k first.
+    client
+        .put_object()
+        .bucket("mpbucket")
+        .key("k")
+        .body(ByteStream::from(b"original-single-put".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // Now complete a multipart to the same key.
+    let p1 = vec![b'x'; 30];
+    let p2 = vec![b'y'; 40];
+    let p3 = vec![b'z'; 10];
+    let etag = complete_three_parts(&client, "mpbucket", "k", &p1, &p2, &p3).await;
+    assert!(etag.contains("-3"));
+
+    let mut concat = p1.clone();
+    concat.extend_from_slice(&p2);
+    concat.extend_from_slice(&p3);
+    let on_disk = std::fs::read(server.object_path("mpbucket", "k")).unwrap();
+    assert_eq!(on_disk, concat, "multipart content replaced the single-put");
+}
+
+#[tokio::test]
+async fn abort_removes_staging_and_upload() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+    let uid = create_upload(&client, "mpbucket", "k").await;
+    upload_part(&client, "mpbucket", "k", &uid, 1, b"some-bytes").await;
+    let stage = server.datadir.multipart_dir().join(&uid);
+    assert!(stage.is_dir());
+
+    client
+        .abort_multipart_upload()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .send()
+        .await
+        .expect("abort 200");
+
+    assert!(!stage.exists(), "staging dir gone after abort");
+
+    // Subsequent list-parts → NoSuchUpload.
+    let err = client
+        .list_parts()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .send()
+        .await
+        .expect_err("list after abort must fail");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchUpload"));
+
+    // No object row was created → head 404.
+    let err = client
+        .head_object()
+        .bucket("mpbucket")
+        .key("k")
+        .send()
+        .await
+        .expect_err("head after abort must 404");
+    assert_eq!(err.into_service_error().meta().code(), Some("NotFound"));
+}
+
+#[tokio::test]
+async fn complete_error_paths() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "mpbucket").await;
+
+    // Set up an upload with two parts.
+    let uid = create_upload(&client, "mpbucket", "k").await;
+    let e1 = upload_part(&client, "mpbucket", "k", &uid, 1, b"AAAAA").await;
+    let e2 = upload_part(&client, "mpbucket", "k", &uid, 2, b"BBBBB").await;
+
+    // (a) Wrong part ETag → InvalidPart.
+    let bad = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag("\"00000000000000000000000000000000\"")
+                .build(),
+        )
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .multipart_upload(bad)
+        .send()
+        .await
+        .expect_err("wrong etag must fail");
+    assert_eq!(err.into_service_error().meta().code(), Some("InvalidPart"));
+
+    // (b) Parts out of ascending order → InvalidPartOrder.
+    let descending = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(2).e_tag(&e2).build())
+        .parts(CompletedPart::builder().part_number(1).e_tag(&e1).build())
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .multipart_upload(descending)
+        .send()
+        .await
+        .expect_err("descending order must fail");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidPartOrder")
+    );
+
+    // (c) Empty part list → InvalidRequest.
+    let empty = CompletedMultipartUpload::builder().build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id(&uid)
+        .multipart_upload(empty)
+        .send()
+        .await
+        .expect_err("empty list must fail");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidRequest")
+    );
+
+    // (d) Bogus upload id on complete → NoSuchUpload.
+    let one = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).e_tag(&e1).build())
+        .build();
+    let err = client
+        .complete_multipart_upload()
+        .bucket("mpbucket")
+        .key("k")
+        .upload_id("deadbeefdeadbeefdeadbeefdeadbeef")
+        .multipart_upload(one)
+        .send()
+        .await
+        .expect_err("bogus upload id must fail");
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchUpload"));
+}

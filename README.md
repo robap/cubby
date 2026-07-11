@@ -27,7 +27,7 @@ On first run `serve` creates the data directory with this layout:
     my-bucket/
       photos/cat.jpg
   .tmp/             # in-flight uploads (same filesystem → atomic rename)
-  .multipart/       # reserved for multipart (Phase 3)
+  .multipart/       # staged multipart parts: <upload_id>/<part_number>
 ```
 
 Point any S3 client at it with **path-style** addressing:
@@ -89,6 +89,45 @@ table is the clustered index scanned in key order, so there is no `readdir`.
 Ordering is lexicographic by raw UTF-8 bytes, matching SQLite's default `BINARY`
 collation and S3's own order.
 
+## Multipart (Phase 3)
+
+boto3 and the AWS CLI auto-switch to multipart upload for files larger than 8MB,
+so the full five-verb lifecycle is supported:
+
+- **CreateMultipartUpload** (`POST /<bucket>/<key>?uploads`) — allocates an
+  opaque `upload_id` and captures the `Content-Type` and user metadata for the
+  eventual object. Requires an existing bucket (`404 NoSuchBucket` otherwise).
+- **UploadPart** (`PUT /<bucket>/<key>?partNumber=N&uploadId=…`) — streams one
+  part to `.multipart/<upload_id>/<N>` with the same incremental-MD5/fsync path
+  as PutObject, and returns the part's ETag (quoted hex MD5). Part numbers run
+  `1..=10000` (outside → `400 InvalidArgument`); re-uploading a number replaces
+  it (last write wins).
+- **ListParts** (`GET /<bucket>/<key>?uploadId=…`) — lists recorded parts
+  ascending with `PartNumber`/`Size`/`ETag`; `max-parts` defaults to and caps at
+  1000, `part-number-marker` resumes strictly after.
+- **CompleteMultipartUpload** (`POST /<bucket>/<key>?uploadId=…`) — validates the
+  client's part list, then **assembles one real file**: the selected parts are
+  streamed in ascending order into `.tmp/`, fsync'd, atomically renamed into
+  `buckets/<b>/<key>`, and the object row is written last. Afterwards the object
+  is byte-for-byte an ordinary object — `cat`, `cmp`, Range GET, HEAD, and
+  listing all work unchanged.
+- **AbortMultipartUpload** (`DELETE /<bucket>/<key>?uploadId=…`) — drops the part
+  rows and the `.multipart/<upload_id>/` tree; no object is created.
+
+An unknown `upload_id` on UploadPart/Complete/Abort/ListParts is `404
+NoSuchUpload`. Complete rejects an empty part list with `InvalidRequest`, a
+non-ascending list with `InvalidPartOrder`, and a missing or ETag-mismatched
+part with `InvalidPart`.
+
+**Composite ETag.** A completed multipart object's ETag is `md5-of-md5s-N`: the
+hex MD5 of the concatenated **raw** 16-byte part digests (recorded at UploadPart,
+never re-read from the data), suffixed `-<part count>`. A single-part upload
+still gets `-1`. This is what real S3 returns, so sync tools (`rclone`, `aws s3
+sync`) compare ETags correctly instead of re-transferring.
+
+The 5MiB-minimum-part-size rule is **deliberately not enforced** (dev-tool
+ergonomics — tests can drive the whole lifecycle with tiny parts).
+
 ### Addressing
 
 Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
@@ -96,8 +135,9 @@ Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
 
 ### Not yet implemented
 
-Multipart uploads (Phase 3), presigned URLs and CopyObject/DeleteObjects
-(Phase 4), and the web UI at `/_/` (Phase 5, currently a `501` placeholder).
+Presigned URLs and CopyObject/DeleteObjects (Phase 4), and the web UI at `/_/`
+(Phase 5, currently a `501` placeholder). ListMultipartUploads and
+UploadPartCopy are not implemented (`NotImplemented`).
 
 ## Storage model
 

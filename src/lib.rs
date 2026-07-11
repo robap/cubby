@@ -12,4 +12,5 @@ pub mod db;
 pub mod http;
 pub mod keypath;
 pub mod listing;
+pub mod multipart;
 pub mod store;
