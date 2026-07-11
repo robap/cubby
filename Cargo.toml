@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 md-5 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 percent-encoding = "2"
+base64 = "0.22"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror = "2"
 anyhow = "1"

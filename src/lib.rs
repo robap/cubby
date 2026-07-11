@@ -11,4 +11,5 @@ pub mod datadir;
 pub mod db;
 pub mod http;
 pub mod keypath;
+pub mod listing;
 pub mod store;

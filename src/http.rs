@@ -62,7 +62,7 @@ impl hyper::service::Service<hyper::Request<Incoming>> for Router {
 
 /// Build the routed service (S3 backend + fixed-credential SigV4 auth).
 pub fn build_router(cfg: &ServeConfig) -> Router {
-    let store = Store::new(cfg.db.clone(), cfg.datadir.clone());
+    let store = Store::new(cfg.db.clone(), cfg.datadir.clone(), cfg.access_key.clone());
     let mut builder = S3ServiceBuilder::new(store);
     builder.set_auth(SimpleAuth::from_single(
         cfg.access_key.clone(),

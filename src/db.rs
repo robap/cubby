@@ -128,17 +128,7 @@ impl Db {
                 "SELECT bucket, key, size, etag, content_type, last_modified, metadata \
                  FROM objects WHERE bucket = ?1 AND key = ?2",
                 rusqlite::params![bucket, key],
-                |r| {
-                    Ok(ObjectRow {
-                        bucket: r.get(0)?,
-                        key: r.get(1)?,
-                        size: r.get(2)?,
-                        etag: r.get(3)?,
-                        content_type: r.get(4)?,
-                        last_modified: r.get(5)?,
-                        metadata: r.get(6)?,
-                    })
-                },
+                object_row_from,
             )
             .optional()
         })
@@ -155,6 +145,69 @@ impl Db {
         })
     }
 
+    /// One index-backed page of a bucket's objects, in ascending key order.
+    ///
+    /// This is the sole seek primitive ListObjectsV2 stands on. The `objects`
+    /// table is `WITHOUT ROWID` with `PK(bucket, key)`, so the table *is* the
+    /// clustered index and this is a bounded range scan over it — no readdir,
+    /// no whole-bucket load.
+    ///
+    /// - `prefix` restricts to keys in `[prefix, successor(prefix))`. Empty
+    ///   prefix means the whole bucket.
+    /// - `from` is an **inclusive** lower bound (`key >= from`): the resume
+    ///   cursor. `None` starts at the beginning of the prefix range. The engine
+    ///   encodes "strictly after key K" as `from = "K\0"` and "past group P" as
+    ///   `from = successor(P)`, so a single inclusive bound serves both.
+    /// - at most `limit` rows are returned; `limit == 0` yields an empty vec.
+    ///
+    /// Rows come back in BINARY (raw UTF-8 byte) order, exactly S3's order.
+    pub fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        from: Option<&str>,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ObjectRow>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        // Effective inclusive lower bound: the later of the resume cursor and
+        // the prefix start. Both are `>=` constraints; taking the max keeps the
+        // scan tight and lets a single bound cover the common empty-prefix case.
+        let lower: &str = match from {
+            Some(f) if f > prefix => f,
+            _ => prefix,
+        };
+        let upper = crate::listing::successor(prefix); // None == scan to bucket end
+
+        self.with_conn(|c| match upper {
+            Some(upper) => {
+                let mut stmt = c.prepare(
+                    "SELECT bucket, key, size, etag, content_type, last_modified, metadata \
+                     FROM objects \
+                     WHERE bucket = ?1 AND key >= ?2 AND key < ?3 \
+                     ORDER BY key LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![bucket, lower, upper, limit],
+                    object_row_from,
+                )?;
+                rows.collect()
+            }
+            None => {
+                let mut stmt = c.prepare(
+                    "SELECT bucket, key, size, etag, content_type, last_modified, metadata \
+                     FROM objects \
+                     WHERE bucket = ?1 AND key >= ?2 \
+                     ORDER BY key LIMIT ?3",
+                )?;
+                let rows =
+                    stmt.query_map(rusqlite::params![bucket, lower, limit], object_row_from)?;
+                rows.collect()
+            }
+        })
+    }
+
     /// All buckets, `(name, created_at)` in lexicographic name order.
     pub fn list_buckets(&self) -> rusqlite::Result<Vec<BucketRow>> {
         self.with_conn(|c| {
@@ -168,6 +221,20 @@ impl Db {
             rows.collect()
         })
     }
+}
+
+/// Build an [`ObjectRow`] from a `SELECT bucket, key, size, etag, content_type,
+/// last_modified, metadata` row (column order fixed).
+fn object_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
+    Ok(ObjectRow {
+        bucket: r.get(0)?,
+        key: r.get(1)?,
+        size: r.get(2)?,
+        etag: r.get(3)?,
+        content_type: r.get(4)?,
+        last_modified: r.get(5)?,
+        metadata: r.get(6)?,
+    })
 }
 
 /// A row of the `buckets` table.
@@ -280,6 +347,86 @@ mod tests {
             no_rowid.is_err(),
             "WITHOUT ROWID table should not expose rowid"
         );
+    }
+
+    /// Insert a bare object row (only key matters for listing-order tests).
+    fn seed(db: &Db, bucket: &str, key: &str) {
+        db.put_object(&ObjectRow {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            size: 0,
+            etag: "d41d8cd98f00b204e9800998ecf8427e".to_owned(),
+            content_type: None,
+            last_modified: 0,
+            metadata: "{}".to_owned(),
+        })
+        .unwrap();
+    }
+
+    fn keys(db: &Db, bucket: &str, prefix: &str, from: Option<&str>, limit: i64) -> Vec<String> {
+        db.list_objects_page(bucket, prefix, from, limit)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect()
+    }
+
+    #[test]
+    fn list_page_orders_by_binary_utf8() {
+        let (_tmp, db) = open_temp();
+        // Insert deliberately out of order; expect BINARY byte order back:
+        // 'A'(0x41) < '_'(0x5F) < 'a'(0x61) < '~'(0x7E).
+        for k in ["~tilde", "a", "A", "_under"] {
+            seed(&db, "b", k);
+        }
+        assert_eq!(
+            keys(&db, "b", "", None, 100),
+            ["A", "_under", "a", "~tilde"]
+        );
+    }
+
+    #[test]
+    fn list_page_prefix_bound_excludes_non_matches() {
+        let (_tmp, db) = open_temp();
+        for k in ["notes.txt", "photos/a", "photos/b", "photoz", "q"] {
+            seed(&db, "b", k);
+        }
+        // Only keys in ["photos/", successor) — "photoz" (0x7A > '/') is out.
+        assert_eq!(
+            keys(&db, "b", "photos/", None, 100),
+            ["photos/a", "photos/b"]
+        );
+    }
+
+    #[test]
+    fn list_page_from_is_inclusive_lower_bound() {
+        let (_tmp, db) = open_temp();
+        for k in ["k0", "k1", "k2", "k3"] {
+            seed(&db, "b", k);
+        }
+        // `from` is inclusive: "k1" is returned.
+        assert_eq!(keys(&db, "b", "", Some("k1"), 100), ["k1", "k2", "k3"]);
+        // "strictly after k1" is expressed as from = "k1\0".
+        assert_eq!(keys(&db, "b", "", Some("k1\0"), 100), ["k2", "k3"]);
+    }
+
+    #[test]
+    fn list_page_respects_limit() {
+        let (_tmp, db) = open_temp();
+        for k in ["k0", "k1", "k2", "k3", "k4"] {
+            seed(&db, "b", k);
+        }
+        assert_eq!(keys(&db, "b", "", None, 2), ["k0", "k1"]);
+        assert!(keys(&db, "b", "", None, 0).is_empty());
+    }
+
+    #[test]
+    fn list_page_is_scoped_to_the_bucket() {
+        let (_tmp, db) = open_temp();
+        seed(&db, "a", "shared");
+        seed(&db, "b", "shared");
+        seed(&db, "b", "only-b");
+        assert_eq!(keys(&db, "b", "", None, 100), ["only-b", "shared"]);
     }
 
     #[test]

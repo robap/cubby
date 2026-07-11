@@ -82,12 +82,27 @@ impl TestServer {
     /// exercise "bucket not empty" paths). Writes over a second connection —
     /// WAL allows this concurrently with the server's connection.
     pub fn seed_object_row(&self, bucket: &str, key: &str) {
-        let conn = rusqlite::Connection::open(self.datadir.meta_db_path()).unwrap();
-        conn.execute(
-            "INSERT INTO objects (bucket, key, size, etag, last_modified, metadata) \
-             VALUES (?1, ?2, 0, 'seed', 0, '{}')",
-            rusqlite::params![bucket, key],
-        )
-        .unwrap();
+        self.seed_object_rows(bucket, std::iter::once(key));
+    }
+
+    /// Bulk-insert synthetic object rows in one transaction. Listing reads only
+    /// SQLite, so this is a fast way to build a large fixture bucket without
+    /// driving thousands of PutObject requests.
+    pub fn seed_object_rows<'a>(&self, bucket: &str, keys: impl IntoIterator<Item = &'a str>) {
+        let mut conn = rusqlite::Connection::open(self.datadir.meta_db_path()).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO objects \
+                     (bucket, key, size, etag, last_modified, metadata) \
+                     VALUES (?1, ?2, 0, 'd41d8cd98f00b204e9800998ecf8427e', 0, '{}')",
+                )
+                .unwrap();
+            for key in keys {
+                stmt.execute(rusqlite::params![bucket, key]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
     }
 }

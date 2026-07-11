@@ -605,6 +605,472 @@ async fn underscore_prefix_returns_501_placeholder() {
     assert!(body.contains("Phase 5"), "placeholder body: {body}");
 }
 
+/// The five-key `photos` fixture from the spec, seeded as real objects.
+async fn seed_photos(client: &aws_sdk_s3::Client) {
+    use aws_sdk_s3::primitives::ByteStream;
+    make_bucket(client, "photos").await;
+    for key in [
+        "notes.txt",
+        "photos/index.md",
+        "photos/2024/a.jpg",
+        "photos/2024/b.jpg",
+        "photos/2025/c.jpg",
+    ] {
+        client
+            .put_object()
+            .bucket("photos")
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn v2_prefix_delimiter_groups_and_counts() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .prefix("photos/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("list v2");
+
+    let cps: Vec<&str> = out
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix())
+        .collect();
+    assert_eq!(cps, ["photos/2024/", "photos/2025/"]);
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["photos/index.md"]);
+    assert_eq!(out.key_count(), Some(3), "keys + prefixes counted together");
+    assert_eq!(out.is_truncated(), Some(false));
+    // Echoed request fields.
+    assert_eq!(out.name(), Some("photos"));
+    assert_eq!(out.prefix(), Some("photos/"));
+    assert_eq!(out.delimiter(), Some("/"));
+}
+
+#[tokio::test]
+async fn v2_top_level_is_notes_and_photos_prefix() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .delimiter("/")
+        .send()
+        .await
+        .unwrap();
+    let cps: Vec<&str> = out
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix())
+        .collect();
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(cps, ["photos/"]);
+    assert_eq!(keys, ["notes.txt"]);
+}
+
+#[tokio::test]
+async fn v2_recursive_lists_all_five_in_order() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(
+        keys,
+        [
+            "notes.txt",
+            "photos/2024/a.jpg",
+            "photos/2024/b.jpg",
+            "photos/2025/c.jpg",
+            "photos/index.md",
+        ],
+        "flat, lexicographic, no dir markers"
+    );
+    assert!(out.common_prefixes().is_empty());
+    // Fields present on a content object.
+    let first = &out.contents()[0];
+    assert_eq!(first.storage_class().map(|s| s.as_str()), Some("STANDARD"));
+    assert!(first.e_tag().unwrap().starts_with('"'), "ETag is quoted");
+    assert!(first.owner().is_none(), "no Owner without fetch-owner");
+}
+
+#[tokio::test]
+async fn v2_fetch_owner_includes_owner() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .fetch_owner(true)
+        .send()
+        .await
+        .unwrap();
+    let owner = out.contents()[0].owner().expect("Owner present");
+    assert_eq!(owner.id(), Some(common::ACCESS_KEY));
+    assert_eq!(owner.display_name(), Some(common::ACCESS_KEY));
+}
+
+#[tokio::test]
+async fn v2_pagination_yields_every_key_once_in_order() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "paged").await;
+    let keys: Vec<String> = (0..2500).map(|i| format!("k{i:05}")).collect();
+    server.seed_object_rows("paged", keys.iter().map(String::as_str));
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut req = client.list_objects_v2().bucket("paged").max_keys(1000);
+        if let Some(t) = &token {
+            req = req.continuation_token(t);
+        }
+        let out = req.send().await.expect("page");
+        pages += 1;
+        let page_keys: Vec<String> = out
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .map(str::to_owned)
+            .collect();
+        assert!(page_keys.len() <= 1000, "page over the cap");
+        collected.extend(page_keys);
+        if out.is_truncated() == Some(true) {
+            token = Some(
+                out.next_continuation_token()
+                    .expect("truncated page has a token")
+                    .to_owned(),
+            );
+        } else {
+            assert!(
+                out.next_continuation_token().is_none(),
+                "last page has no token"
+            );
+            break;
+        }
+    }
+    assert_eq!(pages, 3, "2500 / 1000 → 3 pages");
+    assert_eq!(collected.len(), 2500, "no dupes, none dropped");
+    assert_eq!(collected, keys, "every key once, in order");
+}
+
+#[tokio::test]
+async fn v2_max_keys_is_capped_at_1000() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "paged").await;
+    server.seed_object_rows(
+        "paged",
+        (0..2500)
+            .map(|i| format!("k{i:05}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+    );
+
+    let out = client
+        .list_objects_v2()
+        .bucket("paged")
+        .max_keys(5000)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        out.contents().len() <= 1000,
+        "request for 5000 capped to 1000"
+    );
+    assert_eq!(out.contents().len(), 1000);
+    assert_eq!(out.is_truncated(), Some(true));
+    assert_eq!(out.max_keys(), Some(1000), "echoed MaxKeys is the cap");
+}
+
+#[tokio::test]
+async fn v2_start_after_begins_strictly_after() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "paged").await;
+    server.seed_object_rows(
+        "paged",
+        (0..2500)
+            .map(|i| format!("k{i:05}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+    );
+
+    let out = client
+        .list_objects_v2()
+        .bucket("paged")
+        .start_after("k01000")
+        .max_keys(3)
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["k01001", "k01002", "k01003"]);
+    assert_eq!(out.start_after(), Some("k01000"), "StartAfter echoed");
+}
+
+#[tokio::test]
+async fn v2_negative_max_keys_is_invalid_argument() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "paged").await;
+    let err = client
+        .list_objects_v2()
+        .bucket("paged")
+        .max_keys(-1)
+        .send()
+        .await
+        .expect_err("negative max-keys");
+    assert_eq!(err.code(), Some("InvalidArgument"), "unexpected: {err:?}");
+}
+
+#[tokio::test]
+async fn v2_bad_continuation_token_is_invalid_argument() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "paged").await;
+    let err = client
+        .list_objects_v2()
+        .bucket("paged")
+        .continuation_token("not*valid*base64")
+        .send()
+        .await
+        .expect_err("bad token");
+    assert_eq!(err.code(), Some("InvalidArgument"), "unexpected: {err:?}");
+}
+
+#[tokio::test]
+async fn v2_no_match_prefix_is_empty_not_truncated() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .prefix("nope/")
+        .send()
+        .await
+        .unwrap();
+    assert!(out.contents().is_empty());
+    assert!(out.common_prefixes().is_empty());
+    assert_eq!(out.key_count(), Some(0));
+    assert_eq!(out.is_truncated(), Some(false));
+}
+
+#[tokio::test]
+async fn v2_encoding_type_url_round_trips_a_weird_key() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::EncodingType;
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "photos").await;
+    let weird = "my report (v2).txt";
+    client
+        .put_object()
+        .bucket("photos")
+        .key(weird)
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+
+    let out = client
+        .list_objects_v2()
+        .bucket("photos")
+        .encoding_type(EncodingType::Url)
+        .send()
+        .await
+        .expect("list with encoding-type=url");
+
+    assert_eq!(
+        out.encoding_type(),
+        Some(&EncodingType::Url),
+        "EncodingType echoed"
+    );
+    // The SDK returns the raw (encoded) key from the XML; a percent-decode
+    // recovers the real name, which is exactly what rclone does.
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(
+        keys,
+        ["my%20report%20%28v2%29.txt"],
+        "key is URL-encoded on the wire"
+    );
+    assert_eq!(buckit::listing::url_encode(weird), keys[0]);
+
+    // Without encoding-type the same key lists literally (encoding is
+    // presentation-only; the stored key is unchanged).
+    let plain = client
+        .list_objects_v2()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    let plain_keys: Vec<&str> = plain.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(plain_keys, [weird], "stored key untouched");
+}
+
+#[tokio::test]
+async fn v2_missing_bucket_is_no_such_bucket() {
+    let server = TestServer::spawn().await;
+    let err = server
+        .client()
+        .list_objects_v2()
+        .bucket("ghost")
+        .send()
+        .await
+        .expect_err("missing bucket");
+    assert_eq!(err.code(), Some("NoSuchBucket"), "unexpected: {err:?}");
+}
+
+#[tokio::test]
+async fn v1_delimiter_groups_and_always_has_owner() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    seed_photos(&client).await;
+
+    let out = client
+        .list_objects()
+        .bucket("photos")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("list v1");
+    let cps: Vec<&str> = out
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix())
+        .collect();
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(cps, ["photos/"]);
+    assert_eq!(keys, ["notes.txt"]);
+    // v1 always includes Owner.
+    assert!(
+        out.contents()[0].owner().is_some(),
+        "v1 Contents carry Owner unconditionally"
+    );
+    // Not truncated (well under 1000) ⇒ no NextMarker even with a delimiter.
+    assert_eq!(out.is_truncated(), Some(false));
+    assert!(out.next_marker().is_none());
+}
+
+#[tokio::test]
+async fn v1_next_marker_present_only_with_delimiter() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "listv1").await;
+    // Five delimiter groups; force truncation at max-keys=2.
+    server.seed_object_rows("listv1", ["g1/a", "g1/b", "g2/a", "g3/a", "g4/a", "g5/a"]);
+
+    // With a delimiter: truncated page carries a resuming NextMarker.
+    let mut cps = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut req = client
+            .list_objects()
+            .bucket("listv1")
+            .delimiter("/")
+            .max_keys(2);
+        if let Some(m) = &marker {
+            req = req.marker(m);
+        }
+        let out = req.send().await.expect("v1 page");
+        cps.extend(
+            out.common_prefixes()
+                .iter()
+                .filter_map(|c| c.prefix())
+                .map(str::to_owned),
+        );
+        if out.is_truncated() == Some(true) {
+            marker = Some(
+                out.next_marker()
+                    .expect("delimiter truncation → NextMarker")
+                    .to_owned(),
+            );
+        } else {
+            assert!(out.next_marker().is_none(), "final page has no NextMarker");
+            break;
+        }
+    }
+    assert_eq!(
+        cps,
+        ["g1/", "g2/", "g3/", "g4/", "g5/"],
+        "each group once, in order"
+    );
+
+    // Without a delimiter: truncated but NextMarker is absent (client resumes
+    // from the last Key itself).
+    let out = client
+        .list_objects()
+        .bucket("listv1")
+        .max_keys(2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.is_truncated(), Some(true));
+    assert!(
+        out.next_marker().is_none(),
+        "no delimiter ⇒ no NextMarker (S3 quirk)"
+    );
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["g1/a", "g1/b"]);
+}
+
+#[tokio::test]
+async fn v1_marker_resumes_strictly_after() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    make_bucket(&client, "listv1").await;
+    server.seed_object_rows("listv1", ["a", "b", "c", "d"]);
+
+    let out = client
+        .list_objects()
+        .bucket("listv1")
+        .marker("b")
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["c", "d"], "marker is strictly-after");
+    assert_eq!(out.marker(), Some("b"), "Marker echoed");
+}
+
+#[tokio::test]
+async fn v1_missing_bucket_is_no_such_bucket() {
+    let server = TestServer::spawn().await;
+    let err = server
+        .client()
+        .list_objects()
+        .bucket("ghost")
+        .send()
+        .await
+        .expect_err("missing bucket");
+    assert_eq!(err.code(), Some("NoSuchBucket"), "unexpected: {err:?}");
+}
+
 /// Send a raw HTTP/1.1 GET and return `(status_code, body)`. Dependency-free.
 async fn raw_http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

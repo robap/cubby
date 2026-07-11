@@ -10,15 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use s3s::dto::{
-    Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadBucketInput,
-    HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-    Metadata, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+    Bucket, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag, EncodingType, GetObjectInput,
+    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, Metadata, Object, ObjectStorageClass, Owner, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use crate::datadir::DataDir;
 use crate::db::{Db, DeleteBucketOutcome, ObjectRow};
+use crate::listing::{self, ListPage, ListParams};
 
 /// Monotonic counter for unique temp-file names within this process.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,11 +34,18 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 pub struct Store {
     db: Db,
     dirs: DataDir,
+    /// The configured access key, used as the fixed dev `Owner` identity in
+    /// listings (we have no real IAM; a stable owner keeps SDKs happy).
+    access_key: String,
 }
 
 impl Store {
-    pub fn new(db: Db, dirs: DataDir) -> Self {
-        Self { db, dirs }
+    pub fn new(db: Db, dirs: DataDir, access_key: String) -> Self {
+        Self {
+            db,
+            dirs,
+            access_key,
+        }
     }
 
     /// Stream a request body to a fresh temp file in `.tmp/`, hashing MD5
@@ -95,6 +105,55 @@ impl Store {
         }
     }
 
+    /// Run the pure listing engine against the SQLite seek primitive, entirely
+    /// inside one `spawn_blocking` (the engine drives `fetch` synchronously and
+    /// re-seeks for skip-scan). Shared by ListObjectsV2 and legacy ListObjects.
+    async fn run_listing(
+        &self,
+        bucket: String,
+        prefix: String,
+        delimiter: Option<String>,
+        start_from: Option<String>,
+        skip_cp_le: Option<String>,
+        max_keys: usize,
+    ) -> S3Result<ListPage<ObjectRow>> {
+        self.db_call(move |db| {
+            // The engine calls `fetch` repeatedly; capture the first DB error and
+            // surface it after the run rather than unwinding through the engine.
+            let mut db_err: Option<rusqlite::Error> = None;
+            let fetch = |from: Option<&str>, limit: i64| -> Vec<ObjectRow> {
+                match db.list_objects_page(&bucket, &prefix, from, limit) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        db_err.get_or_insert(e);
+                        Vec::new()
+                    }
+                }
+            };
+            let params = ListParams {
+                prefix: &prefix,
+                delimiter: delimiter.as_deref(),
+                start_from,
+                skip_cp_le: skip_cp_le.as_deref(),
+                max_keys,
+            };
+            let page = listing::list_page(fetch, |r: &ObjectRow| r.key.as_str(), &params);
+            match db_err {
+                Some(e) => Err(e),
+                None => Ok(page),
+            }
+        })
+        .await
+    }
+
+    /// The fixed dev `Owner`, included only when the caller asks for it.
+    fn owner(&self, include: bool) -> Option<Owner> {
+        include.then(|| Owner {
+            id: Some(self.access_key.clone()),
+            display_name: Some(self.access_key.clone()),
+        })
+    }
+
     /// Run a blocking database closure off the async runtime, mapping both the
     /// join failure and any rusqlite error to an S3 `InternalError`.
     async fn db_call<T, F>(&self, f: F) -> S3Result<T>
@@ -126,6 +185,50 @@ pub(crate) fn unix_now() -> i64 {
 /// Parse the stored JSON metadata object into an S3 `Metadata` map.
 pub(crate) fn parse_metadata(json: &str) -> S3Result<Metadata> {
     serde_json::from_str(json).map_err(internal)
+}
+
+/// Apply S3's `max-keys` policy, which `s3s` passes through unvalidated:
+/// default 1000, silently cap at 1000, `0` is a valid empty page, negative is
+/// `400 InvalidArgument`.
+fn resolve_max_keys(max_keys: Option<i32>) -> S3Result<usize> {
+    match max_keys {
+        None => Ok(1000),
+        Some(n) if n < 0 => Err(s3_error!(InvalidArgument, "max-keys must be non-negative")),
+        Some(n) => Ok((n as usize).min(1000)),
+    }
+}
+
+/// Map a stored [`ObjectRow`] to a listing `Object`, with a fixed `STANDARD`
+/// storage class and the ETag quoted the same way GET/PUT return it. `encode`
+/// is presentation-only (identity, or [`listing::url_encode`] for
+/// `encoding-type=url`) — the stored key is never mutated.
+fn object_from_row(
+    row: ObjectRow,
+    owner: Option<Owner>,
+    encode: &dyn Fn(&str) -> String,
+) -> Object {
+    Object {
+        key: Some(encode(&row.key)),
+        e_tag: Some(ETag::Strong(row.etag)),
+        size: Some(row.size),
+        last_modified: Some(ts_from_unix(row.last_modified)),
+        storage_class: Some(ObjectStorageClass::from_static(
+            ObjectStorageClass::STANDARD,
+        )),
+        owner,
+        ..Default::default()
+    }
+}
+
+/// The presentation encoder selected by a request's `encoding-type`: identity,
+/// or percent-encoding when `url` was asked for. Applied to `Key`, `Prefix`,
+/// `Delimiter`, `StartAfter`, and each `CommonPrefix`.
+fn key_encoder(encoding_type: Option<&EncodingType>) -> Box<dyn Fn(&str) -> String> {
+    if encoding_type.map(EncodingType::as_str) == Some(EncodingType::URL) {
+        Box::new(|s: &str| listing::url_encode(s))
+    } else {
+        Box::new(|s: &str| s.to_owned())
+    }
 }
 
 /// Build an S3 timestamp from Unix seconds.
@@ -386,6 +489,152 @@ impl s3s::S3 for Store {
             .collect();
         Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
+            ..Default::default()
+        }))
+    }
+
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let prefix = input.prefix.unwrap_or_default();
+        let max_keys = resolve_max_keys(input.max_keys)?;
+
+        // A listing on a bucket that doesn't exist is NoSuchBucket, not empty.
+        let b = bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&b)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
+        }
+
+        // Cursor precedence: an opaque continuation-token wins over start-after
+        // (which is only honored on the first page).
+        let start_from = match (&input.continuation_token, &input.start_after) {
+            (Some(tok), _) => Some(
+                listing::decode_token(tok)
+                    .map_err(|_| s3_error!(InvalidArgument, "invalid continuation-token"))?,
+            ),
+            (None, Some(sa)) => Some(format!("{sa}\0")),
+            (None, None) => None,
+        };
+
+        let page = self
+            .run_listing(
+                bucket.clone(),
+                prefix.clone(),
+                input.delimiter.clone(),
+                start_from,
+                None, // v2 has no marker skip
+                max_keys,
+            )
+            .await?;
+
+        // `encoding-type=url` percent-encodes presentation of keys/prefixes/
+        // delimiter/start-after so XML-unsafe bytes round-trip; stored keys are
+        // untouched.
+        let encode = key_encoder(input.encoding_type.as_ref());
+
+        let owner = self.owner(input.fetch_owner.unwrap_or(false));
+        let key_count = (page.contents.len() + page.common_prefixes.len()) as i32;
+        let contents: Vec<Object> = page
+            .contents
+            .into_iter()
+            .map(|row| object_from_row(row, owner.clone(), encode.as_ref()))
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = page
+            .common_prefixes
+            .into_iter()
+            .map(|p| CommonPrefix {
+                prefix: Some(encode(&p)),
+            })
+            .collect();
+        let next_continuation_token = page.next_cursor.as_deref().map(listing::encode_token);
+
+        Ok(S3Response::new(ListObjectsV2Output {
+            name: Some(bucket),
+            prefix: Some(encode(&prefix)),
+            delimiter: input.delimiter.as_deref().map(&encode),
+            max_keys: Some(max_keys as i32),
+            key_count: Some(key_count),
+            is_truncated: Some(page.is_truncated),
+            contents: (!contents.is_empty()).then_some(contents),
+            common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
+            continuation_token: input.continuation_token,
+            next_continuation_token,
+            start_after: input.start_after.as_deref().map(&encode),
+            encoding_type: input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+        let prefix = input.prefix.unwrap_or_default();
+        let max_keys = resolve_max_keys(input.max_keys)?;
+
+        let b = bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&b)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
+        }
+
+        // v1 uses a plaintext `marker` = "start strictly after this key". A key
+        // resumes at `marker\0`; groups already covered (`CommonPrefix <=
+        // marker`) are skipped so a delimiter-resume doesn't re-emit them.
+        let (start_from, skip_cp_le) = match &input.marker {
+            Some(m) => (Some(format!("{m}\0")), Some(m.clone())),
+            None => (None, None),
+        };
+
+        let page = self
+            .run_listing(
+                bucket.clone(),
+                prefix.clone(),
+                input.delimiter.clone(),
+                start_from,
+                skip_cp_le,
+                max_keys,
+            )
+            .await?;
+
+        let encode = key_encoder(input.encoding_type.as_ref());
+        // v1 always carries Owner (there is no fetch-owner toggle).
+        let owner = self.owner(true);
+        let contents: Vec<Object> = page
+            .contents
+            .into_iter()
+            .map(|row| object_from_row(row, owner.clone(), encode.as_ref()))
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = page
+            .common_prefixes
+            .into_iter()
+            .map(|p| CommonPrefix {
+                prefix: Some(encode(&p)),
+            })
+            .collect();
+        // S3 quirk: NextMarker is present only when a delimiter is set (and the
+        // page is truncated). Without a delimiter the client resumes from the
+        // last `Key` itself.
+        let next_marker = match (input.delimiter.is_some(), page.next_marker) {
+            (true, Some(m)) => Some(encode(&m)),
+            _ => None,
+        };
+
+        Ok(S3Response::new(ListObjectsOutput {
+            name: Some(bucket),
+            prefix: Some(encode(&prefix)),
+            marker: input.marker.as_deref().map(&encode),
+            delimiter: input.delimiter.as_deref().map(&encode),
+            max_keys: Some(max_keys as i32),
+            is_truncated: Some(page.is_truncated),
+            contents: (!contents.is_empty()).then_some(contents),
+            common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
+            next_marker,
+            encoding_type: input.encoding_type,
             ..Default::default()
         }))
     }

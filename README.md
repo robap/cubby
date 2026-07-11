@@ -62,6 +62,33 @@ Configure the AWS CLI with the default credentials (`aws configure`): access key
 - **ETags:** hex MD5 of the object body, computed while streaming the write.
 - **Content-Type** and user metadata (`x-amz-meta-*`) are stored and returned.
 
+## Listing (Phase 2)
+
+**ListObjectsV2** (`GET /<bucket>?list-type=2`) and legacy **ListObjects v1**
+(`GET /<bucket>`) are supported, served entirely from SQLite — the `objects`
+table is the clustered index scanned in key order, so there is no `readdir`.
+
+- **`prefix`** — restrict to keys beginning with it.
+- **`delimiter`** — an arbitrary string (commonly `/`); keys sharing the run up
+  to the next delimiter roll up into `CommonPrefixes` ("folders"), emitted once
+  via an index skip-scan rather than by walking every member.
+- **`max-keys`** — page size; default 1000, silently **capped at 1000**. `0`
+  returns an empty page; a negative value is `400 InvalidArgument`. Keys and
+  common prefixes count **together** toward the limit.
+- **`continuation-token`** (v2) — an **opaque** cursor for the next page; a
+  malformed token is `400 InvalidArgument`. **`marker`** (v1) is the plaintext
+  equivalent, with `NextMarker` returned only when a `delimiter` is set (an S3
+  quirk — otherwise resume from the last `Key`).
+- **`start-after`** (v2) — begin strictly after the given key on the first page.
+- **`encoding-type=url`** — percent-encode `Key`/`Prefix`/`Delimiter`/
+  `StartAfter`/`CommonPrefixes` in the response so XML-unsafe bytes round-trip;
+  stored keys are unchanged.
+- **`fetch-owner`** (v2) — include a fixed dev `Owner` (id = display name = the
+  access key); v1 always includes it. **`StorageClass`** is always `STANDARD`.
+
+Ordering is lexicographic by raw UTF-8 bytes, matching SQLite's default `BINARY`
+collation and S3's own order.
+
 ### Addressing
 
 Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
@@ -69,9 +96,8 @@ Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
 
 ### Not yet implemented
 
-ListObjectsV2 (Phase 2), multipart uploads (Phase 3), presigned URLs and
-CopyObject/DeleteObjects (Phase 4), and the web UI at `/_/` (Phase 5, currently
-a `501` placeholder).
+Multipart uploads (Phase 3), presigned URLs and CopyObject/DeleteObjects
+(Phase 4), and the web UI at `/_/` (Phase 5, currently a `501` placeholder).
 
 ## Storage model
 

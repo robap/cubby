@@ -675,6 +675,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-types",
+ "base64",
  "bytes",
  "clap",
  "futures",
