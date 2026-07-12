@@ -5,12 +5,17 @@
 //! pieces the `cubby` binary wires together, and lets integration tests spawn
 //! a server in-process on an ephemeral port.
 
+pub mod access_log;
+pub mod api;
 pub mod banner;
 pub mod cli;
 pub mod datadir;
 pub mod db;
+pub mod embed;
+pub mod events;
 pub mod http;
 pub mod keypath;
 pub mod listing;
 pub mod multipart;
+pub mod presign;
 pub mod store;

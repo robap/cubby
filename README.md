@@ -51,6 +51,7 @@ Configure the AWS CLI with the default credentials (`aws configure`): access key
 | `--port <PORT>` | `9000` | Port. `0` binds an ephemeral port, printed machine-parseably. |
 | `--access-key <KEY>` | `local` | Access key clients must present (env: `CUBBY_ACCESS_KEY`). |
 | `--secret-key <KEY>` | `localsecret` | Secret key clients sign with (env: `CUBBY_SECRET_KEY`). |
+| `--quiet` | off | Suppress the per-request live-log line on stdout (see [Web UI](#web-ui-phase-5)). |
 
 ## Supported operations (Phase 1)
 
@@ -202,12 +203,54 @@ Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
 
 ### Not yet implemented
 
-The web UI at `/_/` (Phase 5, currently a `501` placeholder).
 ListMultipartUploads and UploadPartCopy (`x-amz-copy-source` on an UploadPart)
 are not implemented (`NotImplemented`). Copy-source conditional headers
 (`x-amz-copy-source-if-*`) are parsed and ignored. Browser cross-origin access
 to the S3 API needs CORS (`--cors`), a later flag; a presigned URL still works
 from a browser, only cross-origin `fetch()` is gated.
+
+## Web UI (Phase 5)
+
+cubby serves a built-in **S3 debugger** at **`/_/`** — no extra process, no
+Node, no build step for you; it ships inside the binary. Open
+`http://127.0.0.1:9000/_/` after `serve`.
+
+- **Live request log** (the home screen) — a live-streaming table of the S3
+  requests *your app* makes: resolved operation (`PutObject`,
+  `CreateMultipartUpload`, `UploadPart`, …), bucket/key, status (colored by
+  class), duration, and byte counts. Filter as you type, pause (with an "N new"
+  badge), and click a row to expand its full fields (`op`, `auth`, `error_code`).
+  A big `s3.upload()` visibly decomposes into `CreateMultipartUpload` +
+  N×`UploadPart` + `CompleteMultipartUpload` in real time, and a `403` shows its
+  error code so you can see *why* at a glance. The same stream is on stdout (one
+  aligned line per request — suppress with **`--quiet`**) and at
+  `GET /_/api/events` as SSE or `?format=ndjson` for `jq`/tests.
+- **Bucket browser** — a file-explorer over your buckets: folder navigation
+  (prefix + `/` delimiter) with breadcrumbs, drag-and-drop upload into the
+  current prefix, per-row download and delete, a **"+ New bucket"** button, and a
+  substring **key search** (scoped to a bucket or across all buckets).
+- **Object detail** — metadata (size, content-type, ETag, last-modified,
+  `x-amz-meta-*`), inline preview for images / text / JSON, and a
+  **presigned-URL** generator (GET/PUT + expiry picker) that mints a
+  credential-less link.
+
+The log mirrors **client** S3 traffic only; uploads/deletes/bucket-creates done
+*through the UI* go straight to storage and deliberately do not appear in it, so
+the log stays an honest picture of what your app did.
+
+> **The UI shares the S3 API's trust boundary — it is unauthenticated.** Running
+> with `--bind 0.0.0.0` exposes the web UI (and the `/_/api/*` seam) to the
+> network along with the S3 API. Keep cubby on `127.0.0.1` unless you mean to
+> share it.
+
+The presigned URLs minted by the UI's Generate button carry the same
+**host-in-signature** constraint as SDK-generated ones — see the
+[Docker gotcha](#presigned-urls-query-string-auth) above.
+
+**Building from source.** The UI lives in `web/` as a [`zero`](https://github.com/robap/zero)
+project and is compiled into the binary by `build.rs`, so `zero` must be on
+`PATH` to build cubby: `cargo install zero --locked`, then `cargo build`. The
+build fails loudly if `zero` is missing. (Prebuilt binaries need none of this.)
 
 ## Storage model
 

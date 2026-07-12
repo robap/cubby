@@ -1,0 +1,10 @@
+# Framework-owned cache (type defs, SCSS tokens, fonts, component lib).
+# Regenerated from ../zero.toml via `zero update -y` — build.rs does this
+# automatically when absent. zero's own generated .gitignore ignores it too.
+# Never hand-edit.
+.zero/
+# Built fresh by `zero build` (via build.rs); never committed (decision #1).
+dist/
+# Test / mutation reports.
+coverage/
+mutation/

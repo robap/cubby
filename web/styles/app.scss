@@ -1,0 +1,686 @@
+@use '../.zero/styles/zero';
+
+// cubby — the S3 debugger. Dense, terminal-adjacent dev tool; dark is the hero.
+// Built on zero's tokens (colors, space, radius, type) so both themes come for
+// free. Monospace for keys, ETags, sizes, and the log.
+
+// ── App shell ──────────────────────────────────────────────────────────────
+// Direction / alignment / spacing come from zero's primitives + utilities on
+// the elements (split, flank, stack, cluster, gap-*). SCSS carries only what no
+// utility can express: full-viewport height, scroll containment, and fills.
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr; // top bar, then the body fills the rest
+  height: 100dvh;
+  border-bottom: var(--border-md) solid var(--color-primary);
+}
+
+.app-body {
+  min-height: 0; // let the scroll regions inside contain their overflow
+  overflow: hidden;
+}
+
+.app-main {
+  min-height: 0;
+}
+
+.screen {
+  flex: 1;
+  min-height: 0;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.accent {
+  color: var(--color-primary);
+}
+
+.section-label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-semi);
+  letter-spacing: var(--tracking-caps);
+  color: var(--color-text-subtle);
+  text-transform: uppercase;
+}
+
+// ── Top bar ──────────────────────────────────────────────────────────────
+.topbar {
+  background: var(--color-surface);
+}
+
+.brand-mark {
+  color: var(--color-primary);
+  font-size: var(--font-size-lg);
+}
+
+.brand-name {
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-snug);
+}
+
+.badge-version {
+  font-size: var(--font-size-sm);
+  padding: 0 var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  color: var(--color-text-muted);
+}
+
+.chrome-label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-semi);
+  letter-spacing: var(--tracking-wide);
+  color: var(--color-text-subtle);
+}
+
+.chrome-value {
+  font-size: var(--font-size-sm);
+  padding: 0 var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+}
+
+.status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-3xl);
+  background: var(--color-text-subtle);
+
+  &.ok {
+    background: var(--color-success);
+  }
+
+  &.down {
+    background: var(--color-danger);
+  }
+}
+
+.status-text {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.theme-toggle {
+  border: var(--border-thin) solid var(--color-border);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  border-radius: var(--radius-3xl);
+  width: 2rem;
+  height: 2rem;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+}
+
+// ── Left nav ──────────────────────────────────────────────────────────────
+// flank sizes the nav to its content; the footer sits at the bottom via
+// `stack justify-between` on the element. Only a comfortable min-width and the
+// surface color live here.
+.nav {
+  min-width: 12rem;
+  background: var(--color-surface);
+  overflow-y: auto;
+}
+
+.nav-heading {
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-semi);
+  letter-spacing: var(--tracking-caps);
+  color: var(--color-text-subtle);
+  padding: var(--space-sm) var(--space-sm) var(--space-xs);
+}
+
+.nav-item {
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  text-decoration: none;
+  font-weight: var(--weight-medium);
+
+  &:hover {
+    background: var(--hover-bg);
+    color: var(--color-text);
+  }
+
+  &.active {
+    background: var(--color-primary-soft);
+    color: var(--color-primary);
+    font-weight: var(--weight-semi);
+  }
+}
+
+.live-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-3xl);
+  background: var(--color-success);
+}
+
+.nav-footer {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+// ── Shared toolbar bits ──────────────────────────────────────────────────
+.toolbar,
+.listing-toolbar {
+  flex-shrink: 0;
+  background: var(--color-surface);
+}
+
+.toolbar-filter,
+.search-field {
+  width: 22rem;
+  max-width: 100%;
+}
+
+.count {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.pause-btn,
+.all-buckets-btn {
+  border: var(--border-thin) solid var(--color-border-strong);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  padding: var(--space-xs) var(--space-md);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+
+  &.paused,
+  &.active {
+    background: var(--color-primary-soft);
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+}
+
+// ── Live log table ────────────────────────────────────────────────────────
+.log-wrap {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.log-table,
+.listing-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+
+  thead th {
+    position: sticky;
+    top: 0;
+    font-weight: var(--weight-semi);
+    letter-spacing: var(--tracking-wide);
+    color: var(--color-text-subtle);
+    background: var(--color-bg);
+    padding: var(--space-sm) var(--space-md);
+    border-bottom: var(--border-thin) solid var(--color-border);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: var(--space-sm) var(--space-md);
+    border-bottom: var(--border-thin) solid var(--color-border);
+    vertical-align: middle;
+  }
+}
+
+.log-row {
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+}
+
+.c-time,
+.c-dur,
+.c-bytes {
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.c-op {
+  font-weight: var(--weight-semi);
+  color: var(--color-text);
+}
+
+.c-key {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-muted);
+}
+
+.c-dur.slow {
+  color: var(--color-warning);
+}
+
+// Method tags — colored by verb.
+.method {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-semi);
+  padding: 0 var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  color: var(--color-text-muted);
+}
+
+.m-get {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.m-put {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.m-post {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.m-delete {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+// Status pills — colored by class.
+.pill {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-semi);
+  padding: 0 var(--space-sm);
+  border-radius: var(--radius-3xl);
+  background: var(--color-surface-strong);
+  color: var(--color-text-muted);
+}
+
+.s-ok {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.s-redirect {
+  background: var(--color-surface-strong);
+  color: var(--color-text-muted);
+}
+
+.s-warn {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.s-err {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+// Expanded detail row.
+.log-detail td {
+  background: var(--color-surface);
+  padding: 0;
+}
+
+.detail-grid {
+  --grid-min: 12rem;
+  gap: var(--space-sm) var(--space-lg);
+  padding: var(--space-md) var(--space-lg);
+}
+
+.kv {
+  display: flex;
+  gap: var(--space-sm);
+
+  .k {
+    color: var(--color-text-subtle);
+    min-width: 6rem;
+  }
+
+  .v {
+    color: var(--color-text);
+  }
+}
+
+// ── Empty states ──────────────────────────────────────────────────────────
+.empty-state {
+  height: 100%;
+  min-height: 12rem;
+  color: var(--color-text-muted);
+  padding: var(--space-xl);
+}
+
+.empty-icon {
+  font-size: var(--font-size-2xl);
+  opacity: 0.6;
+}
+
+// ── Bucket browser ────────────────────────────────────────────────────────
+// browser-screen is a `flank`: the buckets column (fixed) beside the listing
+// pane (fills). SCSS carries only the column width, scroll, and divider.
+.browser-screen {
+  min-height: 0;
+}
+
+.buckets-col {
+  width: 15rem;
+  border-right: var(--border-thin) solid var(--color-border);
+  overflow-y: auto;
+  padding: var(--space-sm);
+  gap: var(--space-xs);
+}
+
+.bucket-row {
+  gap: var(--space-xs);
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+
+  &.active {
+    background: var(--color-primary-soft);
+
+    .bucket-name {
+      color: var(--color-primary);
+    }
+  }
+}
+
+.new-bucket-btn {
+  width: 100%;
+  border: var(--border-thin) dashed var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text-muted);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  cursor: pointer;
+
+  &:hover {
+    color: var(--color-primary);
+    border-color: var(--color-primary);
+  }
+}
+
+.bucket-name {
+  font-weight: var(--weight-semi);
+  color: var(--color-text);
+}
+
+.bucket-sub {
+  font-size: var(--font-size-sm);
+}
+
+.listing-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.folder-view,
+.search-results {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.breadcrumb {
+  border-bottom: var(--border-thin) solid var(--color-border);
+}
+
+.crumb {
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-weight: var(--weight-semi);
+  cursor: pointer;
+  padding: 0 var(--space-xs);
+
+  &:hover {
+    color: var(--color-primary);
+  }
+}
+
+.crumb-sep {
+  color: var(--color-text-subtle);
+}
+
+.listing-row {
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+}
+
+.folder-icon,
+.file-icon {
+  opacity: 0.8;
+}
+
+.link {
+  color: var(--color-primary);
+}
+
+.row-action {
+  color: var(--color-text-subtle);
+  text-decoration: none;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+
+  &:hover {
+    color: var(--color-text);
+  }
+}
+
+.row-delete:hover {
+  color: var(--color-danger);
+}
+
+.etag-val {
+  color: var(--color-text-subtle);
+}
+
+// Search highlight + all-buckets tag.
+mark {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  border-radius: var(--radius-xs);
+}
+
+.bucket-tag {
+  font-size: var(--font-size-sm);
+  padding: 0 var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+// Drag-drop overlay.
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  background: var(--color-primary-soft);
+  border: var(--border-md) dashed var(--color-primary);
+  color: var(--color-primary);
+  font-weight: var(--weight-semi);
+  pointer-events: none;
+}
+
+.listing-pane.dragging .drop-overlay {
+  display: flex;
+}
+
+// ── Object detail ─────────────────────────────────────────────────────────
+.detail-screen {
+  min-height: 0;
+}
+
+.detail-topbar {
+  flex-shrink: 0;
+  background: var(--color-surface);
+}
+
+.crumb-back {
+  border: var(--border-thin) solid var(--color-border);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  padding: var(--space-xs) var(--space-md);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover-bg);
+  }
+}
+
+.preview-label .chrome-label {
+  letter-spacing: var(--tracking-caps);
+}
+
+.detail-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.preview-pane {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-xl);
+  overflow: auto;
+}
+
+.preview-img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius-md);
+  border: var(--border-thin) solid var(--color-border);
+}
+
+.preview-text {
+  width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  font-size: var(--font-size-sm);
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: var(--border-thin) solid var(--color-border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.preview-download {
+  height: 100%;
+}
+
+.meta-pane {
+  width: 24rem;
+  flex-shrink: 0;
+  border-left: var(--border-thin) solid var(--color-border);
+  overflow-y: auto;
+}
+
+.meta-table {
+  border-radius: var(--radius-md);
+  border: var(--border-thin) solid var(--color-border);
+  overflow: hidden;
+  margin-top: var(--space-sm);
+}
+
+.meta-row {
+  display: flex;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: var(--border-thin) solid var(--color-border);
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  &:nth-child(even) {
+    background: var(--color-surface);
+  }
+}
+
+.meta-k {
+  min-width: 8rem;
+  color: var(--color-text-subtle);
+}
+
+.meta-v {
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+// Presign card.
+.presign-card {
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.segmented {
+  border: var(--border-thin) solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  padding: var(--space-xs) var(--space-md);
+  font-weight: var(--weight-semi);
+  cursor: pointer;
+
+  &.active {
+    background: var(--color-primary);
+    color: var(--color-primary-fg);
+  }
+}
+
+.presign-expiry {
+  flex: 1;
+}
+
+.presign-url {
+  width: 100%;
+  font-size: var(--font-size-sm);
+  padding: var(--space-sm);
+  border-radius: var(--radius-md);
+  border: var(--border-thin) solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+}

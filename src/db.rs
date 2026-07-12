@@ -228,6 +228,17 @@ impl Db {
         })
     }
 
+    /// Total number of buckets. Cheap chrome for the web UI's health payload.
+    pub fn count_buckets(&self) -> rusqlite::Result<i64> {
+        self.with_conn(|c| c.query_row("SELECT COUNT(*) FROM buckets", [], |r| r.get(0)))
+    }
+
+    /// Total number of objects across all buckets. Cheap chrome for the web
+    /// UI's health payload / nav footer.
+    pub fn count_objects(&self) -> rusqlite::Result<i64> {
+        self.with_conn(|c| c.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0)))
+    }
+
     /// All buckets, `(name, created_at)` in lexicographic name order.
     pub fn list_buckets(&self) -> rusqlite::Result<Vec<BucketRow>> {
         self.with_conn(|c| {
@@ -239,6 +250,68 @@ impl Db {
                 })
             })?;
             rows.collect()
+        })
+    }
+
+    /// All buckets with their object count and total byte size, in name order —
+    /// the per-bucket column the web UI's bucket browser shows. A `LEFT JOIN`
+    /// keeps empty buckets (count 0, size 0).
+    pub fn list_buckets_with_stats(&self) -> rusqlite::Result<Vec<BucketStats>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT b.name, b.created_at, COUNT(o.key), COALESCE(SUM(o.size), 0) \
+                 FROM buckets b LEFT JOIN objects o ON o.bucket = b.name \
+                 GROUP BY b.name, b.created_at ORDER BY b.name",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(BucketStats {
+                    name: r.get(0)?,
+                    created_at: r.get(1)?,
+                    object_count: r.get(2)?,
+                    total_size: r.get(3)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Flat substring search over full object keys (`key LIKE '%term%'`),
+    /// optionally scoped to one bucket, ascending by `(bucket, key)`, capped at
+    /// `limit`. This is a **UI/seam convenience, not an S3 capability** (S3 lists
+    /// by prefix only); a leading-wildcard `LIKE` can't use the clustered
+    /// `(bucket, key)` index, so it is a full scan — acceptable for a dev tool.
+    /// `limit <= 0` yields an empty vec.
+    pub fn search_objects(
+        &self,
+        bucket: Option<&str>,
+        term: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ObjectRow>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        // Escape the LIKE metacharacters so a term such as `50%` or `a_b`
+        // matches literally rather than as a wildcard.
+        let pattern = format!("%{}%", escape_like(term));
+        self.with_conn(|c| match bucket {
+            Some(b) => {
+                let mut stmt = c.prepare(
+                    "SELECT bucket, key, size, etag, content_type, last_modified, metadata \
+                     FROM objects WHERE bucket = ?1 AND key LIKE ?2 ESCAPE '\\' \
+                     ORDER BY bucket, key LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![b, pattern, limit], object_row_from)?;
+                rows.collect()
+            }
+            None => {
+                let mut stmt = c.prepare(
+                    "SELECT bucket, key, size, etag, content_type, last_modified, metadata \
+                     FROM objects WHERE key LIKE ?1 ESCAPE '\\' \
+                     ORDER BY bucket, key LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![pattern, limit], object_row_from)?;
+                rows.collect()
+            }
         })
     }
 
@@ -425,6 +498,29 @@ pub struct BucketRow {
     pub name: String,
     /// Unix seconds.
     pub created_at: i64,
+}
+
+/// A bucket plus aggregate stats, for the web UI's bucket column.
+#[derive(Debug, Clone)]
+pub struct BucketStats {
+    pub name: String,
+    /// Unix seconds.
+    pub created_at: i64,
+    pub object_count: i64,
+    pub total_size: i64,
+}
+
+/// Escape SQL `LIKE` metacharacters (`\`, `%`, `_`) so a search term matches
+/// literally under `ESCAPE '\'`.
+fn escape_like(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    for ch in term.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// A row of the `objects` table.
@@ -698,6 +794,99 @@ mod tests {
         // Same key in another bucket is untouched.
         assert!(db.get_object("a", "shared").unwrap().is_some());
         assert!(db.get_object("b", "shared").unwrap().is_none());
+    }
+
+    #[test]
+    fn counts_reflect_rows() {
+        let (_tmp, db) = open_temp();
+        assert_eq!(db.count_buckets().unwrap(), 0);
+        assert_eq!(db.count_objects().unwrap(), 0);
+        db.create_bucket("b", 0).unwrap();
+        db.create_bucket("c", 0).unwrap();
+        seed(&db, "b", "k1");
+        seed(&db, "b", "k2");
+        seed(&db, "c", "k1");
+        assert_eq!(db.count_buckets().unwrap(), 2);
+        assert_eq!(db.count_objects().unwrap(), 3);
+    }
+
+    #[test]
+    fn list_buckets_with_stats_counts_and_sizes() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("empty", 10).unwrap();
+        db.create_bucket("full", 20).unwrap();
+        db.put_object(&ObjectRow {
+            bucket: "full".into(),
+            key: "a".into(),
+            size: 100,
+            etag: "e".into(),
+            content_type: None,
+            last_modified: 0,
+            metadata: "{}".into(),
+        })
+        .unwrap();
+        db.put_object(&ObjectRow {
+            bucket: "full".into(),
+            key: "b".into(),
+            size: 40,
+            etag: "e".into(),
+            content_type: None,
+            last_modified: 0,
+            metadata: "{}".into(),
+        })
+        .unwrap();
+
+        let stats = db.list_buckets_with_stats().unwrap();
+        assert_eq!(stats.len(), 2);
+        // Name order: "empty" < "full".
+        assert_eq!(stats[0].name, "empty");
+        assert_eq!(stats[0].object_count, 0);
+        assert_eq!(stats[0].total_size, 0);
+        assert_eq!(stats[1].name, "full");
+        assert_eq!(stats[1].object_count, 2);
+        assert_eq!(stats[1].total_size, 140);
+    }
+
+    #[test]
+    fn search_objects_is_substring_scoped_and_capped() {
+        let (_tmp, db) = open_temp();
+        for (b, k) in [
+            ("demo", "a/report.pdf"),
+            ("demo", "logs/report-2.txt"),
+            ("demo", "photos/cat.jpg"),
+            ("other", "report.csv"),
+        ] {
+            seed(&db, b, k);
+        }
+
+        // Substring, not prefix: `port` matches mid-key in `a/report.pdf`.
+        let hits = db.search_objects(Some("demo"), "port", 100).unwrap();
+        let keys: Vec<&str> = hits.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["a/report.pdf", "logs/report-2.txt"]);
+
+        // Global (no bucket) spans buckets.
+        let hits = db.search_objects(None, "report", 100).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits
+            .iter()
+            .any(|r| r.bucket == "other" && r.key == "report.csv"));
+
+        // Cap applies (and one extra row can signal truncation to the caller).
+        let capped = db.search_objects(None, "report", 1).unwrap();
+        assert_eq!(capped.len(), 1);
+        // limit <= 0 → empty.
+        assert!(db.search_objects(None, "report", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_objects_escapes_like_metacharacters() {
+        let (_tmp, db) = open_temp();
+        seed(&db, "b", "50%off.txt");
+        seed(&db, "b", "50somethingoff.txt");
+        // `%` in the term must match literally, not as a wildcard.
+        let hits = db.search_objects(Some("b"), "50%off", 100).unwrap();
+        let keys: Vec<&str> = hits.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["50%off.txt"]);
     }
 
     #[test]

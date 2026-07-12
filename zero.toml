@@ -1,0 +1,16 @@
+[project]
+root = "web"
+
+[dev]
+port = 3000
+# Optional: forward unmatched requests to a backend dev server.
+# Your backend must serve HTML at `/`; zero dev injects dev scripts
+# into that response and continues to serve /src, /styles, /public.
+# proxy = "http://localhost:8080"
+
+# `out` is resolved relative to the invocation cwd (the repo root, where this
+# file lives), NOT relative to `root`. So it carries the `web/` prefix to land
+# beside the sources in `web/dist/` — which is what `rust-embed` embeds
+# (`src/embed.rs`, `#[folder = "web/dist/"]`).
+[build]
+out = "web/dist"

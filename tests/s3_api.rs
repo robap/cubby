@@ -597,12 +597,17 @@ async fn get_and_head_on_missing_bucket_are_no_such_bucket() {
 }
 
 #[tokio::test]
-async fn underscore_prefix_returns_501_placeholder() {
+async fn underscore_prefix_serves_the_web_ui() {
     let server = TestServer::spawn().await;
-    // A plain HTTP GET (no SigV4) — the routing layer intercepts before auth.
+    // A plain HTTP GET (no SigV4) — the routing layer intercepts before auth
+    // and serves the embedded zero UI (Phase 5 replaced the 501 placeholder).
     let (status, body) = raw_http_get(server.addr, "/_/").await;
-    assert_eq!(status, 501, "/_/ must be the UI placeholder");
-    assert!(body.contains("Phase 5"), "placeholder body: {body}");
+    assert_eq!(status, 200, "/_/ must serve the embedded UI");
+    assert!(body.contains(r#"id="app""#), "UI index body: {body}");
+    assert!(
+        !body.contains("Phase 5"),
+        "the placeholder body must be gone"
+    );
 }
 
 /// The five-key `photos` fixture from the spec, seeded as real objects.

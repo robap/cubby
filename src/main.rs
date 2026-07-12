@@ -3,6 +3,7 @@ use clap::Parser;
 use cubby::cli::{Cli, Command};
 use cubby::datadir::DataDir;
 use cubby::db::Db;
+use cubby::events::EventBus;
 use cubby::http::{serve, ServeConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -25,6 +26,8 @@ fn main() -> anyhow::Result<()> {
                 secret_key: args.secret_key,
                 datadir: dir,
                 db,
+                events: EventBus::new(),
+                quiet: args.quiet,
             }))
         }
     }

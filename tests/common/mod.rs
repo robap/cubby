@@ -10,6 +10,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use cubby::datadir::DataDir;
 use cubby::db::Db;
+use cubby::events::EventBus;
 use cubby::http::{build_router, run_accept_loop, ServeConfig};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -22,6 +23,8 @@ pub const SECRET_KEY: &str = "localsecret";
 pub struct TestServer {
     pub addr: SocketAddr,
     pub datadir: DataDir,
+    /// The live-request event bus, so tests can subscribe and assert on the log.
+    pub events: EventBus,
     _tmp: TempDir,
 }
 
@@ -35,6 +38,7 @@ impl TestServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let events = EventBus::new();
         let cfg = ServeConfig {
             bind: "127.0.0.1".to_owned(),
             port: 0,
@@ -42,6 +46,8 @@ impl TestServer {
             secret_key: SECRET_KEY.to_owned(),
             datadir: datadir.clone(),
             db,
+            events: events.clone(),
+            quiet: true,
         };
         let router = build_router(&cfg);
         tokio::spawn(run_accept_loop(listener, router));
@@ -49,6 +55,7 @@ impl TestServer {
         Self {
             addr,
             datadir,
+            events,
             _tmp: tmp,
         }
     }

@@ -49,6 +49,10 @@ pub struct ServeArgs {
     /// Secret key clients must sign with.
     #[arg(long, env = "CUBBY_SECRET_KEY", default_value = DEFAULT_SECRET_KEY)]
     pub secret_key: String,
+
+    /// Suppress the per-request stdout log line (useful in CI).
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 #[cfg(test)]
