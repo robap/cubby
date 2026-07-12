@@ -17,7 +17,9 @@ env:
   PYTHON_VERSION: "3.12"
   NODE_VERSION: "20"
   GO_VERSION: "1.22"
-  RCLONE_VERSION: "v1.68.2"
+  # Not named RCLONE_VERSION: rclone maps any RCLONE_* env var to a CLI flag,
+  # and RCLONE_VERSION collides with its boolean --version flag.
+  PINNED_RCLONE_VERSION: "v1.68.2"
 
 jobs:
   # Build cubby once; every client job downloads the same binary.
@@ -82,7 +84,7 @@ jobs:
         if: matrix.client == 'rclone'
         run: |
           set -euo pipefail
-          url="https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          url="https://downloads.rclone.org/${PINNED_RCLONE_VERSION}/rclone-${PINNED_RCLONE_VERSION}-linux-amd64.zip"
           curl -fsSL "$url" -o /tmp/rclone.zip
           unzip -q /tmp/rclone.zip -d /tmp
           sudo cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
