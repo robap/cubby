@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "The SQLite of S3 — a single-binary, S3-compatible object store for local development"
 license = "MIT"
+repository = "https://github.com/robap/cubby"
+homepage = "https://github.com/robap/cubby"
+readme = "README.md"
+keywords = ["s3", "object-storage", "sqlite", "minio", "storage"]
+categories = ["development-tools", "web-programming::http-server", "command-line-utilities"]
+# Explicit allow-list: ship the source and the committed UI artifact, nothing
+# else. `web/dist/**` is the embedded web UI (see src/embed.rs). Deliberately
+# excludes web/src, web/.zero, tests/, s3data/, docs/ so the crate stays small
+# and builds with a Rust toolchain alone (no `zero`).
+# Leading `/` anchors each pattern to the package root: unanchored `LICENSE`
+# / `README.md` are gitignore-style and would also match the many nested
+# node_modules LICENSE/README files under tests/.
+include = ["/src/**", "/web/dist/**", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "cubby"

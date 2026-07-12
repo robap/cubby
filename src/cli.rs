@@ -34,8 +34,11 @@ pub struct ServeArgs {
     /// Data directory. Created (with its layout) if it does not exist.
     pub dir: PathBuf,
 
-    /// Address to bind.
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Address to bind. Defaults to loopback; `--bind 0.0.0.0` (or the
+    /// `CUBBY_BIND` env) exposes it. The container image sets
+    /// `CUBBY_BIND=0.0.0.0` so `-p` is reachable from the host regardless of
+    /// the command args passed to `docker run`; an explicit `--bind` still wins.
+    #[arg(long, env = "CUBBY_BIND", default_value = "127.0.0.1")]
     pub bind: String,
 
     /// Port to listen on. `0` binds an ephemeral port (printed machine-parseably).

@@ -1,0 +1,14 @@
+# Keep the build context small and the container build `zero`-free. The image
+# builds from src/ + the committed web/dist/ only; everything below is either
+# huge, irrelevant to the build, or a dev/UI-source tree the binary doesn't need.
+target/
+s3data/
+.git/
+tests/
+docs/
+web/src/
+web/.zero/
+web/mutation/
+web/coverage/
+web/AGENTS.md
+*.crate

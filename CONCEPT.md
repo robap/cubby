@@ -225,8 +225,11 @@ Docker is a footnote. Compose snippet in README from day one.
 - ~~Name.~~ **Decided: cubby.** (Note: "zero" the framework is nearly
   unsearchable — worth addressing before this project gives it public
   exposure.)
-- Commit `dist/` UI assets? Leaning no: CI runs
-  `cargo install zero --locked` + `zero build` fresh.
+- ~~Commit `dist/` UI assets?~~ **Decided: yes.** `web/dist/` is a committed
+  build artifact so cubby builds with a Rust toolchain alone (principle #5) and
+  ships via crates.io/Docker without `zero`. Regenerate with `zero build` before
+  committing; no CI freshness gate (CI has no `zero`). See
+  `docs/features/distribution-spec.md`.
 - `reindex` command (scan tree, backfill SQLite) for the "seed by copying
   files into the dir" workflow — v0.2 candidate.
 - Language-specific test helpers (`with local_s3() as s3:`) — S3

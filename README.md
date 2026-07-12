@@ -42,12 +42,54 @@ $ cat s3data/buckets/uploads/report.pdf   # the bytes are just a file
 Configure the AWS CLI with the default credentials (`aws configure`): access key
 `local`, secret key `localsecret`, any region.
 
+## Installation
+
+### From crates.io
+
+```console
+$ cargo install cubby
+$ cubby serve ./s3data
+```
+
+Building needs only a Rust toolchain — the web UI ships pre-built inside the
+crate, so there is no Node, no bundler, and nothing else to install.
+
+### Docker / Podman
+
+The image is published for **amd64 and arm64** (Apple Silicon runs natively),
+built on `distroless/static` — just the static binary, no shell, a few MB.
+
+```console
+$ docker run -p 9000:9000 -v "$PWD/s3data:/data" ghcr.io/robap/cubby serve /data
+```
+
+The container binds `0.0.0.0` by default (via `CUBBY_BIND`) so the published port
+is reachable from the host; `127.0.0.1` would not be. Object bytes land in the
+mounted `./s3data` on your host, as real files — `cat s3data/buckets/...` works
+exactly as it does for a native run.
+
+**Podman** uses the identical image and command:
+
+```console
+$ podman run -p 9000:9000 -v "$PWD/s3data:/data" ghcr.io/robap/cubby serve /data
+```
+
+Rootless Podman maps the container's root user to *your* host user, so objects
+written to the mounted directory are already owned by you — no extra flags.
+(Don't reach for `--userns=keep-id` here: the image runs as root, so keep-id
+would instead assign the files to a subordinate UID.)
+
+> **Presigned URLs across the container boundary.** A URL signed inside the
+> container for one host (e.g. a Compose service name) fails when fetched from
+> the host under `localhost`, and vice versa — SigV4 signs the host. See the
+> [Docker gotcha](#presigned-urls-query-string-auth) below.
+
 ## `serve` flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `<DIR>` | — | Data directory (positional, required). Created on first run. |
-| `--bind <ADDR>` | `127.0.0.1` | Address to bind. Use `0.0.0.0` to expose. |
+| `--bind <ADDR>` | `127.0.0.1` | Address to bind. Use `0.0.0.0` to expose (env: `CUBBY_BIND` — the container image sets it). |
 | `--port <PORT>` | `9000` | Port. `0` binds an ephemeral port, printed machine-parseably. |
 | `--access-key <KEY>` | `local` | Access key clients must present (env: `CUBBY_ACCESS_KEY`). |
 | `--secret-key <KEY>` | `localsecret` | Secret key clients sign with (env: `CUBBY_SECRET_KEY`). |
@@ -248,10 +290,12 @@ The presigned URLs minted by the UI's Generate button carry the same
 **host-in-signature** constraint as SDK-generated ones — see the
 [Docker gotcha](#presigned-urls-query-string-auth) above.
 
-**Building from source.** The UI lives in `web/` as a [`zero`](https://github.com/robap/zero)
-project and is compiled into the binary by `build.rs`, so `zero` must be on
-`PATH` to build cubby: `cargo install zero --locked`, then `cargo build`. The
-build fails loudly if `zero` is missing. (Prebuilt binaries need none of this.)
+**Building from source.** Building cubby needs only a Rust toolchain:
+`cargo build`. The web UI is a **committed build artifact** (`web/dist/`,
+embedded by `src/embed.rs`), so `zero` is never on the build path. You only need
+[`zero`](https://github.com/robap/zero) to *modify* the UI: edit `web/src`, run
+`zero build` (`cargo install zero --locked` first), and commit the regenerated
+`web/dist/`. There is no CI gate on UI freshness — regenerate before committing.
 
 ## Seeding fixtures (`--seed`, Phase 6)
 

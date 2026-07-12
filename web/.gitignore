@@ -1,10 +1,12 @@
 # Framework-owned cache (type defs, SCSS tokens, fonts, component lib).
-# Regenerated from ../zero.toml via `zero update -y` — build.rs does this
-# automatically when absent. zero's own generated .gitignore ignores it too.
-# Never hand-edit.
-.zero/
-# Built fresh by `zero build` (via build.rs); never committed (decision #1).
-dist/
+# Regenerated from ../zero.toml via `zero update -y`. Never hand-edit.
+# Anchored (leading slash) so it matches ONLY web/.zero — the framework cache —
+# and NOT web/dist/.zero, whose fonts are part of the committed built UI.
+/.zero/
+# NOTE: web/dist/ is intentionally NOT ignored. The built UI is a committed
+# artifact so cubby builds with a Rust toolchain alone (no `zero` on the build
+# path). Regenerate it with `zero build` and commit the result before pushing.
+# See docs/features/distribution-spec.md.
 # Test / mutation reports.
 coverage/
 mutation/

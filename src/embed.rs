@@ -1,10 +1,12 @@
 //! Embedded web UI assets.
 //!
-//! The `zero` build output (`web/dist/`, produced by `build.rs`) is compiled
-//! into the binary with `rust-embed`, so `./cubby serve` ships the UI with no
-//! Node, no network, and no separate process. In debug builds `rust-embed`
-//! reads `web/dist/` from disk (nice for `cargo run`); release builds embed the
-//! bytes.
+//! `web/dist/` is a **committed** build artifact (the `zero` production build),
+//! compiled into the binary with `rust-embed`, so `./cubby serve` ships the UI
+//! with no Node, no network, and no separate process — and cubby builds with a
+//! Rust toolchain alone, `zero` never on the build path. Regenerating the UI
+//! (`zero build`) is a developer step done before committing, not part of
+//! `cargo build`. In debug builds `rust-embed` reads `web/dist/` from disk
+//! (nice for `cargo run`); release builds embed the bytes.
 //!
 //! Everything is served under the `/_/` mount point (see `http.rs`): real
 //! assets get a long immutable cache header, and any non-asset `/_/…` path
@@ -13,7 +15,7 @@
 //! `zero` emits root-absolute asset refs (`/assets/…`, `/.zero/…`) with no
 //! base-path config, so `index.html` and the CSS are rewritten to the `/_/`
 //! prefix **as they are served** — not at build time. That keeps a bare
-//! `zero build` (what a UI dev runs) working identically to `cargo build`:
+//! `zero build` (what a UI dev runs) working identically to what is embedded:
 //! the on-disk `dist/` stays in `zero`'s native form and the prefixing happens
 //! once, here, where it can't be bypassed or double-applied.
 
@@ -134,7 +136,7 @@ mod tests {
 
     #[test]
     fn index_html_is_embedded_and_hosts_the_app_root() {
-        // Proves `build.rs` produced `web/dist/` and `rust-embed` embedded it.
+        // Proves the committed `web/dist/` is embedded by `rust-embed`.
         let file = Assets::get(INDEX_HTML).expect("index.html is embedded");
         let html = std::str::from_utf8(&file.data).unwrap();
         assert!(

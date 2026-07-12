@@ -207,8 +207,9 @@ This is a **dev tool**, not a production server in a costume.
 
 - ~~**Name**~~ — decided: **cubby**. (`zero`'s searchability is still worth
   addressing before this project gives the framework public exposure.)
-- **Commit `dist/` UI assets?** Leaning no — CI builds fresh with
-  `cargo install zero --locked` + `zero build`. Decide before Phase 5.
+- ~~**Commit `dist/` UI assets?**~~ **Decided: yes** (distribution work) —
+  `web/dist/` is committed so cubby builds with a Rust toolchain alone and ships
+  via crates.io/Docker without `zero`. See `docs/features/distribution-spec.md`.
 - **Single-writer SQLite under one instance hit concurrently** — confirm the
   WAL + `busy_timeout` story holds (parallel *test suites* sidestep this via
   isolated dirs, but a single shared instance does not).
