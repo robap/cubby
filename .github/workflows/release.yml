@@ -1,0 +1,80 @@
+name: release
+
+# Push a version tag to cut a release:
+#   git tag v0.1.1 && git push origin v0.1.1
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write # push the image to ghcr.io (GITHUB_TOKEN gets write here)
+
+jobs:
+  # --- Container image → ghcr.io (multi-arch) ------------------------------
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 emulation so buildx can build linux/arm64 on an amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derives tags from the git tag: v0.1.1 -> :0.1.1 and :latest.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers across releases so the in-container Rust build is fast.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- crates.io (opt-in) --------------------------------------------------
+  crate:
+    runs-on: ubuntu-latest
+    # Set repo variable PUBLISH_TO_CRATES_IO=true and add the CARGO_REGISTRY_TOKEN
+    # secret to enable. Otherwise this job is skipped.
+    if: ${{ vars.PUBLISH_TO_CRATES_IO == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keep crates.io and the image tag from drifting: the pushed tag must equal
+      # the Cargo.toml version (cargo publish uses Cargo.toml, not the tag).
+      - name: Tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          crate_ver=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')
+          tag_ver="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag_ver  Cargo.toml=$crate_ver"
+          test "$crate_ver" = "$tag_ver"
+
+      # Verification build compiles the packaged crate (embeds web/dist/, no
+      # `zero`). Fails loudly if the committed UI or the include list is off.
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
