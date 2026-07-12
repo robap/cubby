@@ -1,0 +1,96 @@
+name: conformance
+
+# The v0.1 definition of done, made executable: five real S3 clients each drive
+# a live cubby through a >8MB multipart round-trip, a prefix+delimiter listing,
+# and a presigned GET. Per-client jobs report red/green independently so a single
+# SDK regression is obvious. When this workflow is green on `main`, v0.1 ships.
+#
+# Scope is deliberately the five-client matrix only — the Rust inner loop
+# (cargo test / clippy / fmt) lands with the full CI later, not duplicated here.
+
+on:
+  push:
+  pull_request:
+
+# Pinned toolchain versions for reproducibility.
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  GO_VERSION: "1.22"
+  RCLONE_VERSION: "v1.68.2"
+
+jobs:
+  # Build cubby once; every client job downloads the same binary.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build cubby
+        run: cargo build --bin cubby
+      - name: Upload cubby binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cubby-bin
+          path: target/debug/cubby
+          if-no-files-found: error
+          retention-days: 1
+
+  conformance:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one client's failure must not cancel the others
+      matrix:
+        client: [boto3, awscli, js, go, rclone]
+    name: ${{ matrix.client }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download cubby binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cubby-bin
+          path: target/debug
+      - name: Make cubby executable
+        run: chmod +x target/debug/cubby
+
+      # --- per-client toolchains (only the one this job needs) ---
+      - name: Set up Python (boto3)
+        if: matrix.client == 'boto3'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install boto3
+        if: matrix.client == 'boto3'
+        run: python -m pip install --upgrade boto3
+
+      - name: Set up Node (aws-sdk-js v3)
+        if: matrix.client == 'js'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Go (aws-sdk-go-v2)
+        if: matrix.client == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install rclone (pinned)
+        if: matrix.client == 'rclone'
+        run: |
+          set -euo pipefail
+          url="https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL "$url" -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          sudo cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version
+
+      # ubuntu-latest ships aws CLI v2, curl, jq — all the awscli job needs.
+
+      - name: Run ${{ matrix.client }} conformance
+        env:
+          CONFORMANCE_STRICT: "1" # a missing toolchain FAILS the job, never skips
+        run: bash tests/conformance/run.sh ${{ matrix.client }}

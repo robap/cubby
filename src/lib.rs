@@ -18,4 +18,5 @@ pub mod keypath;
 pub mod listing;
 pub mod multipart;
 pub mod presign;
+pub mod seed;
 pub mod store;

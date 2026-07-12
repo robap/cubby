@@ -51,6 +51,9 @@ pub struct ServeConfig {
     pub events: EventBus,
     /// Suppress the pretty per-request stdout line (`--quiet`, for CI).
     pub quiet: bool,
+    /// Optional seed file (`--seed`): applied before the port binds so a
+    /// malformed fixture fails fast without ever looking like a running server.
+    pub seed: Option<std::path::PathBuf>,
 }
 
 /// Shared state the web UI's JSON/SSE seam reads directly. Cheap to clone
@@ -363,6 +366,14 @@ pub async fn run_accept_loop(listener: TcpListener, router: Router) -> std::io::
 
 /// Bind, print the banner, and serve until a fatal error. Used by `main`.
 pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
+    // Apply the seed (if any) *before* binding: a malformed fixture must fail
+    // fast with a non-zero exit and nothing listening, never a running server
+    // in a half-known state. The banner prints only once seeding succeeds.
+    if let Some(seed_path) = &cfg.seed {
+        let store = Store::new(cfg.db.clone(), cfg.datadir.clone(), cfg.access_key.clone());
+        crate::seed::apply(seed_path, &store).await?;
+    }
+
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port)).await?;
     let addr: SocketAddr = listener.local_addr()?;
     banner::print(addr, &cfg.access_key, &cfg.secret_key, cfg.datadir.root());

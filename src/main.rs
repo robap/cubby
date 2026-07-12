@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
                 db,
                 events: EventBus::new(),
                 quiet: args.quiet,
+                seed: args.seed,
             }))
         }
     }

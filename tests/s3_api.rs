@@ -2036,3 +2036,244 @@ async fn delete_objects_over_1000_is_invalid_request() {
         Some("InvalidRequest")
     );
 }
+
+// ---- --seed ----------------------------------------------------------------
+//
+// Inner-loop tests for `seed::apply`, driven through a real server seeded from
+// the committed example `seed.yaml` (its `file:` fixture resolves against the
+// repo root). The outer loop is the AWS CLI acceptance boxes.
+
+/// The committed example seed file at the repo root.
+fn example_seed() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed.yaml")
+}
+
+#[tokio::test]
+async fn seed_creates_buckets_and_inline_object() {
+    let server = TestServer::spawn_seeded(&example_seed()).await;
+    let client = server.client();
+
+    // Both declared buckets exist to S3 and on disk (`reports` has no objects).
+    let out = client.list_buckets().send().await.unwrap();
+    let mut names: Vec<&str> = out.buckets().iter().filter_map(|b| b.name()).collect();
+    names.sort();
+    assert_eq!(names, ["reports", "uploads"]);
+    assert!(server.datadir.bucket_dir("uploads").is_dir());
+    assert!(server.datadir.bucket_dir("reports").is_dir());
+
+    // The inline object is a real cat-able file with the exact bytes…
+    let on_disk = std::fs::read(server.object_path("uploads", "hello.txt")).unwrap();
+    assert_eq!(on_disk, b"hi there\n");
+
+    // …and GET returns those bytes with the content-MD5 ETag of a client PUT.
+    let got = client
+        .get_object()
+        .bucket("uploads")
+        .key("hello.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        got.e_tag(),
+        Some(format!("\"{}\"", md5_hex(b"hi there\n")).as_str())
+    );
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"hi there\n");
+}
+
+#[tokio::test]
+async fn seed_loads_file_backed_object() {
+    let server = TestServer::spawn_seeded(&example_seed()).await;
+    let client = server.client();
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/logo.png");
+    let expected = std::fs::read(&fixture).unwrap();
+
+    // The on-disk file is cmp-clean against the fixture (real bytes loaded).
+    let on_disk = std::fs::read(server.object_path("uploads", "photos/logo.png")).unwrap();
+    assert_eq!(on_disk, expected, "seeded file bytes match the fixture");
+
+    // And GET returns the identical bytes.
+    let got = client
+        .get_object()
+        .bucket("uploads")
+        .key("photos/logo.png")
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn seed_applies_content_type_and_metadata() {
+    let server = TestServer::spawn_seeded(&example_seed()).await;
+    let client = server.client();
+
+    let head = client
+        .head_object()
+        .bucket("uploads")
+        .key("hello.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_type(), Some("text/plain"));
+    assert_eq!(
+        head.metadata()
+            .and_then(|m| m.get("team"))
+            .map(String::as_str),
+        Some("platform")
+    );
+
+    // The file-backed object carried its declared content type too.
+    let head_png = client
+        .head_object()
+        .bucket("uploads")
+        .key("photos/logo.png")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_png.content_type(), Some("image/png"));
+}
+
+#[tokio::test]
+async fn seed_rerun_is_idempotent_and_declarative() {
+    use cubby::datadir::DataDir;
+    use cubby::db::Db;
+    use cubby::store::Store;
+
+    /// A one-shot streaming body over the given bytes (for the out-of-band PUT).
+    fn blob(bytes: &'static [u8]) -> s3s::dto::StreamingBlob {
+        s3s::dto::StreamingBlob::wrap(futures::stream::once(async move {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(bytes))
+        }))
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let datadir = DataDir::new(tmp.path().join("s3data"));
+    datadir.bootstrap().unwrap();
+    let db = Db::open(&datadir.meta_db_path()).unwrap();
+    let store = Store::new(db.clone(), datadir.clone(), "local".to_owned());
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let seed_path = seed_dir.path().join("seed.yaml");
+    let hello = datadir.bucket_dir("uploads").join("hello.txt");
+
+    // First apply.
+    std::fs::write(
+        &seed_path,
+        "buckets:\n  - name: uploads\n    objects:\n      - key: hello.txt\n        content: \"one\"\n",
+    )
+    .unwrap();
+    cubby::seed::apply(&seed_path, &store).await.unwrap();
+    assert_eq!(std::fs::read(&hello).unwrap(), b"one");
+
+    // Re-applying the same seed succeeds — no "bucket already exists" error.
+    cubby::seed::apply(&seed_path, &store).await.unwrap();
+    assert_eq!(std::fs::read(&hello).unwrap(), b"one");
+
+    // A key written out-of-band (not named by the seed) …
+    store
+        .put_bytes(
+            "uploads",
+            "manual.txt",
+            Some(blob(b"manual")),
+            None,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("out-of-band put");
+
+    // …survives a re-serve of an edited seed, whose named key now overwrites.
+    std::fs::write(
+        &seed_path,
+        "buckets:\n  - name: uploads\n    objects:\n      - key: hello.txt\n        content: \"two\"\n",
+    )
+    .unwrap();
+    cubby::seed::apply(&seed_path, &store).await.unwrap();
+    assert_eq!(
+        std::fs::read(&hello).unwrap(),
+        b"two",
+        "named key overwritten"
+    );
+    assert_eq!(
+        std::fs::read(datadir.bucket_dir("uploads").join("manual.txt")).unwrap(),
+        b"manual",
+        "out-of-band key left untouched"
+    );
+}
+
+/// Run `serve()` with the given seed against a fresh temp dir on `port`, and
+/// return its result. Used to prove a bad seed aborts startup *before* binding.
+async fn serve_with_seed(port: u16, seed_path: std::path::PathBuf) -> anyhow::Result<()> {
+    use cubby::datadir::DataDir;
+    use cubby::db::Db;
+    use cubby::events::EventBus;
+    use cubby::http::{serve, ServeConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let datadir = DataDir::new(tmp.path());
+    datadir.bootstrap().unwrap();
+    let db = Db::open(&datadir.meta_db_path()).unwrap();
+    serve(ServeConfig {
+        bind: "127.0.0.1".to_owned(),
+        port,
+        access_key: common::ACCESS_KEY.to_owned(),
+        secret_key: common::SECRET_KEY.to_owned(),
+        datadir,
+        db,
+        events: EventBus::new(),
+        quiet: true,
+        seed: Some(seed_path),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn seed_malformed_fails_fast_without_binding() {
+    // Reserve a currently-free port, then release it so `serve()` may try to
+    // bind it — which it must NOT reach, because the seed is applied first.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let seed_path = seed_dir.path().join("bad.yaml");
+    std::fs::write(&seed_path, "buckets:\n  - name: [not, a, string\n").unwrap();
+
+    let err = serve_with_seed(port, seed_path)
+        .await
+        .expect_err("malformed seed must abort startup");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("seed") || msg.to_lowercase().contains("yaml"),
+        "error should name the seed/YAML problem: {msg}"
+    );
+
+    // Nothing is listening on the port — a connect is refused.
+    let conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    assert!(
+        conn.is_err(),
+        "port {port} must be unbound after a failed seed"
+    );
+}
+
+#[tokio::test]
+async fn seed_missing_file_fails_fast() {
+    let seed_dir = tempfile::tempdir().unwrap();
+    let seed_path = seed_dir.path().join("seed.yaml");
+    std::fs::write(
+        &seed_path,
+        "buckets:\n  - name: uploads\n    objects:\n      - key: k\n        file: ./nope.bin\n",
+    )
+    .unwrap();
+
+    let err = serve_with_seed(0, seed_path)
+        .await
+        .expect_err("a missing file: must abort startup");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("nope.bin") || msg.to_lowercase().contains("no such file"),
+        "error should name the unreadable file: {msg}"
+    );
+}

@@ -98,6 +98,77 @@ impl Store {
         Ok((temp_path, size, hex::encode(hasher.finalize())))
     }
 
+    /// Write `body`'s bytes as the object `bucket/<key>` through the Phase 1
+    /// write path: stream into `.tmp/` (hashing the content-MD5 incrementally,
+    /// never buffering the whole object), fsync, atomically rename into
+    /// `buckets/<b>/<key>`, then write the authoritative SQLite row **last** —
+    /// so a crash between rename and insert leaves only a harmless orphan file.
+    /// Returns the hex content-MD5 (the single-part ETag).
+    ///
+    /// `content_type` defaults to `application/octet-stream` when `None`, and
+    /// `metadata_json` is the user metadata already serialized to a JSON object
+    /// (`{}` for none), exactly as [`put_object`](Self::put_object) stores it.
+    ///
+    /// The bucket is assumed to already exist: PutObject verifies it up front
+    /// before accepting bytes, and the `--seed` loader creates it first. This is
+    /// the single write path shared by PutObject and seeding — no second,
+    /// drifting implementation.
+    pub async fn put_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Option<StreamingBlob>,
+        content_type: Option<String>,
+        metadata_json: String,
+    ) -> S3Result<String> {
+        let final_path = self
+            .dirs
+            .bucket_dir(bucket)
+            .join(crate::keypath::key_to_relpath(key));
+
+        // Streaming atomic write: temp → fsync → rename → row insert.
+        let (temp_path, size, etag_hex) = self.stream_to_temp(body).await?;
+
+        if let Some(parent) = final_path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(internal(err));
+            }
+        }
+        if let Err(err) = tokio::fs::rename(&temp_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(internal(err));
+        }
+
+        // Bytes are durably in place; write the authoritative row last.
+        let row = ObjectRow {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            size,
+            etag: etag_hex.clone(),
+            // S3 defaults a missing content type to binary/octet-stream.
+            content_type: content_type.or_else(|| Some(DEFAULT_CONTENT_TYPE.to_owned())),
+            last_modified: unix_now(),
+            metadata: metadata_json,
+        };
+        self.db_call(move |db| db.put_object(&row)).await?;
+        Ok(etag_hex)
+    }
+
+    /// Create the bucket `name` if it does not already exist: make its directory
+    /// (idempotent) and insert its row (idempotent — an existing bucket is left
+    /// as-is, no error). Mirrors the CreateBucket ordering (directory first,
+    /// then the row) so a crash between them reads as "does not exist". Used by
+    /// the `--seed` loader for its declarative, re-runnable bucket creation.
+    pub async fn create_bucket_if_missing(&self, name: &str) -> S3Result<()> {
+        let dir = self.dirs.bucket_dir(name);
+        tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
+        let name = name.to_owned();
+        self.db_call(move |db| db.create_bucket(&name, unix_now()))
+            .await?;
+        Ok(())
+    }
+
     /// Stream-copy a source object file into a fresh temp file in `.tmp/`,
     /// `fsync`, and return its path. Bytes flow through `tokio::io::copy` a
     /// chunk at a time — the object is never held in memory, the same discipline
@@ -390,41 +461,13 @@ impl s3s::S3 for Store {
             return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
         }
 
-        let final_path = self
-            .dirs
-            .bucket_dir(&bucket)
-            .join(crate::keypath::key_to_relpath(&key));
-
-        // Streaming atomic write: temp → fsync → rename → row insert.
-        let (temp_path, size, etag_hex) = self.stream_to_temp(input.body).await?;
-
-        if let Some(parent) = final_path.parent() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(internal(err));
-            }
-        }
-        if let Err(err) = tokio::fs::rename(&temp_path, &final_path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(internal(err));
-        }
-
-        // Bytes are durably in place; write the authoritative row last.
+        // Delegate to the shared write path: temp → fsync → rename → row-last,
+        // MD5 computed, content-type defaulted.
         let metadata =
             serde_json::to_string(&input.metadata.unwrap_or_default()).map_err(internal)?;
-        let row = ObjectRow {
-            bucket,
-            key,
-            size,
-            etag: etag_hex.clone(),
-            // S3 defaults a missing content type to binary/octet-stream.
-            content_type: input
-                .content_type
-                .or_else(|| Some(DEFAULT_CONTENT_TYPE.to_owned())),
-            last_modified: unix_now(),
-            metadata,
-        };
-        self.db_call(move |db| db.put_object(&row)).await?;
+        let etag_hex = self
+            .put_bytes(&bucket, &key, input.body, input.content_type, metadata)
+            .await?;
 
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),

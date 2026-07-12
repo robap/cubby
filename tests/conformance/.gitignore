@@ -1,0 +1,4 @@
+# Per-client build artifacts / installed deps — never committed.
+js/node_modules/
+js/package-lock.json
+go/cubby-conformance

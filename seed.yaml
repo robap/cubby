@@ -1,0 +1,25 @@
+# Example cubby seed file.
+#
+# Run:  cubby serve ./s3data --seed ./seed.yaml
+#
+# Every bucket and object below exists the instant the server is up — written
+# through the same temp→fsync→rename→SQLite path a client PUT uses, so each
+# object is a real browsable file under s3data/buckets/<bucket>/<key> with a
+# correct content-MD5 ETag. Re-running is idempotent: buckets are created if
+# missing, and each named object is overwritten to match the file.
+
+buckets:
+  - name: uploads
+    objects:
+      # Inline UTF-8 content.
+      - key: hello.txt
+        content: "hi there\n"
+        content_type: text/plain
+        metadata:
+          team: platform
+      # Binary bytes loaded from disk; the path is relative to this seed file.
+      - key: photos/logo.png
+        file: ./tests/fixtures/logo.png
+        content_type: image/png
+  # A bucket with no seeded objects is fine.
+  - name: reports

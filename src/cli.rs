@@ -53,6 +53,11 @@ pub struct ServeArgs {
     /// Suppress the per-request stdout log line (useful in CI).
     #[arg(long)]
     pub quiet: bool,
+
+    /// Seed file (YAML): buckets and fixture objects created on startup, before
+    /// the port binds. A malformed seed fails fast without binding.
+    #[arg(long, value_name = "FILE")]
+    pub seed: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -74,6 +79,15 @@ mod tests {
         assert_eq!(args.port, 9000);
         assert_eq!(args.access_key, DEFAULT_ACCESS_KEY);
         assert_eq!(args.secret_key, DEFAULT_SECRET_KEY);
+        // --seed is opt-in: absent means None (today's behavior, no seeding).
+        assert_eq!(args.seed, None);
+    }
+
+    #[test]
+    fn serve_parses_seed_path() {
+        let cli = Cli::try_parse_from(["cubby", "serve", "data", "--seed", "seed.yaml"]).unwrap();
+        let Command::Serve(args) = cli.command;
+        assert_eq!(args.seed, Some(PathBuf::from("seed.yaml")));
     }
 
     #[test]

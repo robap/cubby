@@ -52,6 +52,7 @@ Configure the AWS CLI with the default credentials (`aws configure`): access key
 | `--access-key <KEY>` | `local` | Access key clients must present (env: `CUBBY_ACCESS_KEY`). |
 | `--secret-key <KEY>` | `localsecret` | Secret key clients sign with (env: `CUBBY_SECRET_KEY`). |
 | `--quiet` | off | Suppress the per-request live-log line on stdout (see [Web UI](#web-ui-phase-5)). |
+| `--seed <FILE>` | — | Seed buckets and fixture objects from a YAML file before the port binds (see [Seeding fixtures](#seeding-fixtures---seed-phase-6)). |
 
 ## Supported operations (Phase 1)
 
@@ -251,6 +252,80 @@ The presigned URLs minted by the UI's Generate button carry the same
 project and is compiled into the binary by `build.rs`, so `zero` must be on
 `PATH` to build cubby: `cargo install zero --locked`, then `cargo build`. The
 build fails loudly if `zero` is missing. (Prebuilt binaries need none of this.)
+
+## Seeding fixtures (`--seed`, Phase 6)
+
+`cubby serve <dir> --seed seed.yaml` declares buckets and fixture objects in a
+file and has them exist the instant the server is up — so a `seed.yaml` checked
+into a repo boots every developer (and every CI run) the same object store.
+This is what makes cubby a **test fixture**, not just a server. Without the flag,
+startup behaves exactly as before (no buckets, no objects).
+
+```yaml
+# seed.yaml
+buckets:
+  - name: uploads
+    objects:
+      - key: hello.txt
+        content: "hi there\n"       # inline UTF-8 literal
+        content_type: text/plain
+        metadata:
+          team: platform            # becomes x-amz-meta-team
+      - key: photos/logo.png
+        file: ./tests/fixtures/logo.png   # raw bytes from disk
+        content_type: image/png
+  - name: reports                    # a bucket with no seeded objects
+```
+
+- Each object declares **exactly one** of `content:` (inline UTF-8) or `file:`
+  (raw bytes; a relative path resolves against the seed file's own directory).
+  `content_type:` and `metadata:` are optional and match what `PutObject` sets.
+- **Seeded objects are real files.** Each is written through the same
+  temp→fsync→rename→SQLite path as a client `PUT`, so it lands at
+  `buckets/<b>/<key>` with a correct content-MD5 ETag — `cat` and `cmp` clean,
+  indistinguishable from an uploaded object. The committed
+  [`seed.yaml`](seed.yaml) is a runnable example.
+- **Idempotent and declarative.** Buckets are created if missing (an existing
+  one is left as-is); a named object overwrites whatever is there
+  (last-writer-wins), while keys *not* in the seed are untouched. Re-serving the
+  same seed is a no-op; edit it and re-serve to update the keys it names.
+- **Fails fast.** Seeding runs after the data dir is prepared but **before the
+  port binds**. Malformed YAML, an unknown field, an object with neither/both of
+  `content`/`file`, or an unreadable `file:` prints a naming error to stderr and
+  exits non-zero **without binding** — a broken fixture never looks like a
+  running server. A half-applied seed (some fixtures written before the bad one)
+  is fine for a dev tool; the loud exit is what matters.
+
+Out of scope (per CONCEPT): adopting pre-existing loose files in `buckets/`
+(that's a future `reindex`), and seeding anything beyond buckets and finished
+objects (no multipart state, versions, or per-bucket config).
+
+## Conformance matrix (Phase 6, the v0.1 promise)
+
+cubby's compatibility promise is **executable, not claimed**: a GitHub Actions
+workflow ([`.github/workflows/conformance.yml`](.github/workflows/conformance.yml))
+runs five real S3 clients — **boto3**, **aws-sdk-js v3**, **aws-sdk-go-v2**,
+**rclone**, and the **AWS CLI** — against a live cubby, each doing the three
+things an app actually does:
+
+1. **round-trip incl. a >8MB upload** that forces the multipart path (bytes
+   verified equal),
+2. **list a nested layout with a prefix + `/` delimiter** (expected keys and
+   `CommonPrefixes`), and
+3. **use a presigned URL** (the client's own signer; `rclone link` for rclone)
+   fetched with no ambient credentials.
+
+Each client is its own matrix job, so a single SDK regression shows up as one red
+check. When the workflow is green on `main`, that's the signal to tag **v0.1**.
+
+Run any client locally against the same harness:
+
+```console
+$ ./tests/conformance/run.sh boto3     # or: awscli | js | go | rclone
+```
+
+Locally a missing toolchain is warn-and-skipped; in CI (`CONFORMANCE_STRICT=1`)
+it fails the job instead, so a real regression can't hide behind a green skip.
 
 ## Storage model
 

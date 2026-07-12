@@ -30,10 +30,32 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn spawn() -> Self {
+        Self::spawn_inner(None).await.expect("spawn server")
+    }
+
+    /// Spawn a server whose data dir has first been seeded from `seed_path`
+    /// (applied through the real `seed::apply`, before serving) — the in-process
+    /// analogue of `cubby serve <dir> --seed <seed_path>`. `file:` fixtures in
+    /// the seed resolve against `seed_path`'s own directory.
+    pub async fn spawn_seeded(seed_path: &std::path::Path) -> Self {
+        Self::spawn_inner(Some(seed_path.to_owned()))
+            .await
+            .expect("spawn seeded server")
+    }
+
+    async fn spawn_inner(seed: Option<PathBuf>) -> anyhow::Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
         let datadir = DataDir::new(tmp.path());
         datadir.bootstrap().unwrap();
         let db = Db::open(&datadir.meta_db_path()).unwrap();
+
+        // Seeding happens before the listener is served, exactly as `serve()`
+        // applies it before binding the port.
+        if let Some(seed_path) = &seed {
+            let store =
+                cubby::store::Store::new(db.clone(), datadir.clone(), ACCESS_KEY.to_owned());
+            cubby::seed::apply(seed_path, &store).await?;
+        }
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -48,16 +70,17 @@ impl TestServer {
             db,
             events: events.clone(),
             quiet: true,
+            seed: None,
         };
         let router = build_router(&cfg);
         tokio::spawn(run_accept_loop(listener, router));
 
-        Self {
+        Ok(Self {
             addr,
             datadir,
             events,
             _tmp: tmp,
-        }
+        })
     }
 
     /// A client signing with the correct default credentials.
