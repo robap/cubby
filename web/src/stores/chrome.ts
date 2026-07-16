@@ -25,29 +25,119 @@ export async function loadHealth(): Promise<void> {
   }
 }
 
-/** The active theme (`"dark"` is the hero). */
-export const theme = signal<"dark" | "light">(readInitialTheme());
+/** The theme *preference*: an explicit override, or follow the OS. */
+export type ThemePref = "dark" | "light" | "system";
+
+/** The effective theme actually applied to `<html>`. */
+export type Theme = "dark" | "light";
+
+/** localStorage key for the persisted preference. Shared with the inline
+ * no-flash bootstrap in `index.html` — keep the two in sync. */
+export const THEME_KEY = "cubby:theme";
+
+/** The cycle order of the three-state theme control. */
+const THEME_ORDER: ThemePref[] = ["dark", "light", "system"];
+
+/** The current theme preference (persisted). Default `system` for a fresh browser. */
+export const themePref = signal<ThemePref>(readStoredPref());
 
 /**
- * Resolve the initial theme from an explicit `data-theme` or the OS setting.
- * @returns {"dark" | "light"}
+ * The next preference in the cycle: dark → light → system → dark.
+ * @param {ThemePref} pref
+ * @returns {ThemePref}
  */
-function readInitialTheme(): "dark" | "light" {
-  const attr = document.documentElement.getAttribute("data-theme");
-  if (attr === "light" || attr === "dark") return attr;
-  const prefersLight =
-    typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: light)").matches;
-  return prefersLight ? "light" : "dark";
+export function nextThemePref(pref: ThemePref): ThemePref {
+  return THEME_ORDER[(THEME_ORDER.indexOf(pref) + 1) % THEME_ORDER.length]!;
 }
 
-/** Flip the theme and stamp it on `<html data-theme>`. */
-export function toggleTheme(): void {
-  const next = theme.val === "dark" ? "light" : "dark";
-  theme.set(next);
-  document.documentElement.setAttribute("data-theme", next);
+/**
+ * Resolve a preference to the effective theme: explicit overrides win; `system`
+ * follows the OS.
+ * @param {ThemePref} pref
+ * @param {boolean} systemPrefersDark
+ * @returns {Theme}
+ */
+export function resolveTheme(pref: ThemePref, systemPrefersDark: boolean): Theme {
+  if (pref === "dark" || pref === "light") return pref;
+  return systemPrefersDark ? "dark" : "light";
 }
 
-/** Apply the resolved theme to `<html>` at startup. */
+/** Whether the OS currently prefers a dark scheme (defaults to dark if unknown). */
+function systemPrefersDark(): boolean {
+  return !(typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: light)").matches);
+}
+
+/** The effective theme for the current preference + OS setting. */
+export function effectiveTheme(): Theme {
+  return resolveTheme(themePref.val, systemPrefersDark());
+}
+
+/**
+ * Coerce a stored value to a valid preference, defaulting to `system` when it is
+ * absent or unrecognized (a brand-new browser matches its environment).
+ * @param {string | null} v
+ * @returns {ThemePref}
+ */
+export function parseThemePref(v: string | null): ThemePref {
+  return v === "dark" || v === "light" || v === "system" ? v : "system";
+}
+
+/**
+ * Read the persisted preference (or the `system` default).
+ * @returns {ThemePref}
+ */
+function readStoredPref(): ThemePref {
+  return parseThemePref(safeLocalGet(THEME_KEY));
+}
+
+/** localStorage getter that tolerates a disabled/absent store. */
+function safeLocalGet(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/** localStorage setter that tolerates a disabled/absent store. */
+function safeLocalSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* storage unavailable (private mode, tests) — the signal still drives the UI */
+  }
+}
+
+/**
+ * Set the theme preference: persist it and stamp the effective theme on
+ * `<html data-theme>`.
+ * @param {ThemePref} pref
+ * @returns {void}
+ */
+export function setThemePref(pref: ThemePref): void {
+  themePref.set(pref);
+  safeLocalSet(THEME_KEY, pref);
+  applyTheme();
+}
+
+/** Advance the preference one step through the cycle and apply it. */
+export function cycleTheme(): void {
+  setThemePref(nextThemePref(themePref.val));
+}
+
+/** Stamp the effective theme on `<html>` (startup and on every change). */
 export function applyTheme(): void {
-  document.documentElement.setAttribute("data-theme", theme.val);
+  document.documentElement.setAttribute("data-theme", effectiveTheme());
+}
+
+/**
+ * Reflect live OS `prefers-color-scheme` changes while the preference is
+ * `system`. Call once at startup.
+ * @returns {void}
+ */
+export function watchSystemTheme(): void {
+  if (typeof matchMedia !== "function") return;
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (themePref.val === "system") applyTheme();
+  });
 }

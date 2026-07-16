@@ -8,6 +8,7 @@ import {
   middleTruncate,
   statusClass,
   targetOf,
+  truncateEnd,
 } from "./format.ts";
 
 describe("groupDigits", () => {
@@ -100,6 +101,20 @@ describe("middleTruncate", () => {
 
   it("does not truncate a key that is exactly the max length", () => {
     expect(middleTruncate("abcde", 5)).toBe("abcde");
+  });
+});
+
+describe("truncateEnd", () => {
+  it("keeps the head and appends an ellipsis when too long", () => {
+    expect(truncateEnd("5730185b04808598d667cf03f6a7c16a", 10)).toBe("5730185b04…");
+  });
+
+  it("leaves a short value untouched", () => {
+    expect(truncateEnd("abcd", 10)).toBe("abcd");
+  });
+
+  it("does not truncate a value that is exactly the max length", () => {
+    expect(truncateEnd("abcde", 5)).toBe("abcde");
   });
 });
 

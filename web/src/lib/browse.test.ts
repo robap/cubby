@@ -1,5 +1,24 @@
 import { describe, it, expect } from "zero/test";
-import { crumbs, folderLabel, highlightParts, uploadKey, viewMode } from "./browse.ts";
+import {
+  crumbs,
+  folderLabel,
+  highlightParts,
+  locationToUrl,
+  parentPrefix,
+  uploadKey,
+  urlToLocation,
+  viewMode,
+} from "./browse.ts";
+import type { BrowseLocation } from "./browse.ts";
+
+/** Parse a URL's query the way the router does (decoded key→value map). */
+function parseQuery(url: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const q = url.indexOf("?");
+  if (q < 0) return out;
+  for (const [k, v] of new URLSearchParams(url.slice(q + 1))) out[k] = v;
+  return out;
+}
 
 describe("viewMode", () => {
   it("is folder browsing when the search term is empty or whitespace", () => {
@@ -41,6 +60,87 @@ describe("uploadKey", () => {
     expect(uploadKey("", "cat.jpg")).toBe("cat.jpg");
     expect(uploadKey("photos/", "cat.jpg")).toBe("photos/cat.jpg");
   });
+});
+
+describe("parentPrefix", () => {
+  it("returns the folder up to and including the last slash", () => {
+    expect(parentPrefix("a/b/c.txt")).toBe("a/b/");
+    expect(parentPrefix("my docs/2026/report.pdf")).toBe("my docs/2026/");
+  });
+
+  it("returns empty for a top-level key", () => {
+    expect(parentPrefix("readme.md")).toBe("");
+  });
+
+  it("keeps a leading-slash key's own slash as the prefix", () => {
+    // A key whose first char is `/` has its slash at index 0 — the boundary
+    // that separates a folder ("/") from a top-level key ("").
+    expect(parentPrefix("/rooted.txt")).toBe("/");
+  });
+});
+
+describe("locationToUrl", () => {
+  it("is the bare browser URL when no bucket is selected", () => {
+    expect(locationToUrl({ bucket: null, prefix: "", object: null })).toBe("/_/browser");
+  });
+
+  it("carries just the bucket at the root", () => {
+    expect(locationToUrl({ bucket: "demo", prefix: "", object: null })).toBe(
+      "/_/browser?bucket=demo",
+    );
+  });
+
+  it("carries a folder prefix, percent-encoding slashes and spaces as %20", () => {
+    const url = locationToUrl({ bucket: "my docs", prefix: "a b/2026/", object: null });
+    expect(url).toBe("/_/browser?bucket=my%20docs&prefix=a%20b%2F2026%2F");
+    expect(url).not.toContain("+");
+  });
+
+  it("carries an object key and omits any prefix (derived on the way back)", () => {
+    const url = locationToUrl({ bucket: "demo", prefix: "a/", object: "a/report v2.pdf" });
+    expect(url).toBe("/_/browser?bucket=demo&object=a%2Freport%20v2.pdf");
+    expect(url).not.toContain("prefix=");
+  });
+});
+
+describe("urlToLocation", () => {
+  it("is the default landing when there is no bucket", () => {
+    expect(urlToLocation({})).toEqual({ bucket: null, prefix: "", object: null });
+  });
+
+  it("reads a folder prefix", () => {
+    expect(urlToLocation({ bucket: "demo", prefix: "a/b/" })).toEqual({
+      bucket: "demo",
+      prefix: "a/b/",
+      object: null,
+    });
+  });
+
+  it("derives an open object's prefix from its key", () => {
+    expect(urlToLocation({ bucket: "demo", object: "a/b/c.txt" })).toEqual({
+      bucket: "demo",
+      prefix: "a/b/",
+      object: "a/b/c.txt",
+    });
+  });
+});
+
+describe("browser location round-trips through a URL", () => {
+  const cases: BrowseLocation[] = [
+    { bucket: null, prefix: "", object: null },
+    { bucket: "demo", prefix: "", object: null },
+    { bucket: "my docs", prefix: "my docs/2026/", object: null },
+    { bucket: "demo", prefix: "a/b/", object: "a/b/report v2.pdf" },
+  ];
+  for (const loc of cases) {
+    it(`round-trips ${JSON.stringify(loc)}`, () => {
+      // An open object drops the stored prefix in the URL, then re-derives it —
+      // so the expected round-trip prefix is the object's own parent.
+      const expected =
+        loc.object !== null ? { ...loc, prefix: parentPrefix(loc.object) } : loc;
+      expect(urlToLocation(parseQuery(locationToUrl(loc)))).toEqual(expected);
+    });
+  }
 });
 
 describe("highlightParts", () => {

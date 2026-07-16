@@ -6,8 +6,11 @@ import { computed, each, effect, html, ref, signal } from "zero";
 import type { Signal, TemplateResult } from "zero";
 import { Input, Select } from "zero/components";
 import type { LogEvent } from "../lib/api.ts";
+import { clearEvents } from "../lib/api.ts";
 import { bytesCell, statusClass, targetOf } from "../lib/format.ts";
-import { appendCapped, elapsedLabel, matchesFilter } from "../lib/log.ts";
+import { PauseIcon, PlayIcon, TrashIcon } from "../components/icons.ts";
+import { locationToUrl, parentPrefix } from "../lib/browse.ts";
+import { appendCapped, matchesFilter, timeAgo } from "../lib/log.ts";
 
 /** Cap on retained rows (matches the server ring's spirit). */
 const MAX_ROWS = 2000;
@@ -25,8 +28,10 @@ type LogState = {
   authFilter: Signal<string>;
   expanded: Signal<number | null>;
   scroller: ReturnType<typeof ref<HTMLElement>>;
-  origin: () => number;
+  /** A coarse "current time" that ticks ~1s so the TIME cells advance. */
+  now: Signal<number>;
   resume: () => void;
+  clear: () => void;
   onScroll: () => void;
 };
 
@@ -36,7 +41,7 @@ type LogState = {
 export default function LiveLog(): TemplateResult {
   const s = createLogState();
   return html`
-    <section class="screen log-screen flex-col">
+    <section class="screen log-screen stack gap-0">
       ${Toolbar(s)}
       <div class="log-wrap" ref=${s.scroller} @scroll=${s.onScroll}>
         ${LogTable(s)}
@@ -64,9 +69,22 @@ function createLogState(): LogState {
   const expanded = signal<number | null>(null);
   const scroller = ref<HTMLElement>();
 
+  // A shared clock that ticks once a second, so the relative TIME labels advance
+  // without touching the 2000-row table body (only the per-cell `${…}` bindings
+  // that read `now` re-run). The interval is cleared when the screen unmounts.
+  const now = signal(Date.now());
+  effect(() => {
+    const id = setInterval(() => now.set(Date.now()), 1000);
+    return () => clearInterval(id);
+  });
+
   const ingest = createIngest(events, paused, newCount, scroller);
+  // Newest first: the freshest request sits at the top of the table. `filter`
+  // returns a fresh array, so reversing it never mutates the stored ring.
   const visible = computed(() =>
-    events.val.filter((e) => matchesFilter(e, filter.val, statusFilter.val, authFilter.val)),
+    events.val
+      .filter((e) => matchesFilter(e, filter.val, statusFilter.val, authFilter.val))
+      .reverse(),
   );
 
   return {
@@ -79,38 +97,75 @@ function createLogState(): LogState {
     authFilter,
     expanded,
     scroller,
-    origin: ingest.origin,
+    now,
     resume: ingest.resume,
+    clear: ingest.clear,
     onScroll: ingest.onScroll,
   };
 }
 
 /**
+ * Open the live SSE stream and hand each frame's `data` to `onFrame`, closing
+ * the source when the screen unmounts (the effect's cleanup).
+ * @param {(data: string) => void} onFrame
+ * @returns {void}
+ */
+function subscribeSse(onFrame: (data: string) => void): void {
+  effect(() => {
+    const es = new EventSource("/_/api/events");
+    es.onmessage = (msg) => onFrame(msg.data);
+    return () => es.close();
+  });
+}
+
+/**
+ * Position the scroller after newest-first rows are inserted at the top: reveal
+ * them when `toTop`, else hold the reader's place by the inserted height delta.
+ * @param {HTMLElement} el
+ * @param {boolean} toTop
+ * @param {number} prevTop
+ * @param {number} prevHeight
+ * @returns {void}
+ */
+function anchorScroll(el: HTMLElement, toTop: boolean, prevTop: number, prevHeight: number): void {
+  el.scrollTop = toTop ? 0 : prevTop + (el.scrollHeight - prevHeight);
+}
+
+/**
  * Wire the SSE stream to `events` with per-animation-frame batching, pause
  * buffering, and auto-scroll bookkeeping. Returns the imperative handles the
- * view needs (`origin`, `resume`, `onScroll`).
- * @returns {{ origin: () => number, resume: () => void, onScroll: () => void }}
+ * view needs (`resume`, `onScroll`).
+ * @returns {{ resume: () => void, onScroll: () => void }}
  */
 function createIngest(
   events: Signal<LogEvent[]>,
   paused: Signal<boolean>,
   newCount: Signal<number>,
   scroller: ReturnType<typeof ref<HTMLElement>>,
-): { origin: () => number; resume: () => void; onScroll: () => void } {
-  let origin = 0; // first event's ts, for the relative TIME column
-  let stick = true; // pinned to bottom → auto-scroll follows new rows
+): { resume: () => void; clear: () => void; onScroll: () => void } {
+  let stick = true; // pinned to the top → new rows (newest first) stay in view
   let incoming: LogEvent[] = []; // buffered until the next frame / resume
   let rafScheduled = false;
 
+  // Empty the local view: drop the retained rows, any buffered batch, and the
+  // paused "N new" count. Driven both by the toolbar Clear and by a server
+  // `clear` frame (so other tabs empty when one clears).
+  const clear = () => {
+    incoming = [];
+    events.set([]);
+    newCount.set(0);
+  };
+
+  // Rows render newest-first, so a new event lands at the *top*. Pinned to the
+  // top we reveal it; if the reader has scrolled down into older rows we hold
+  // their position as rows insert above (see `anchorScroll`).
   const append = (batch: LogEvent[]) => {
     if (batch.length === 0) return;
-    if (origin === 0 && batch[0]) origin = batch[0].ts;
+    const el = scroller.el;
+    const prevHeight = el?.scrollHeight ?? 0;
+    const prevTop = el?.scrollTop ?? 0;
     events.update((prev) => appendCapped(prev, batch, MAX_ROWS));
-    if (stick && !paused.val) {
-      requestAnimationFrame(() => {
-        if (scroller.el) scroller.el.scrollTop = scroller.el.scrollHeight;
-      });
-    }
+    if (el) anchorScroll(el, stick && !paused.val, prevTop, prevHeight);
   };
 
   const flush = () => {
@@ -132,24 +187,26 @@ function createIngest(
     }
   };
 
-  effect(() => {
-    const es = new EventSource("/_/api/events");
-    es.onmessage = (msg) => {
-      try {
-        const parsed = JSON.parse(msg.data) as LogEvent;
-        if (typeof parsed.id === "number") {
-          incoming.push(parsed);
-          schedule();
-        }
-      } catch {
-        /* ignore keep-alive / non-JSON frames */
+  subscribeSse((data) => {
+    try {
+      const parsed = JSON.parse(data) as Partial<LogEvent> & { clear?: boolean };
+      // The server's clear rides the default data channel (`{"clear":true}`),
+      // so this one handler empties the view when any tab clears the ring.
+      if (parsed.clear === true) {
+        clear();
+        return;
       }
-    };
-    return () => es.close();
+      if (typeof parsed.id === "number") {
+        incoming.push(parsed as LogEvent);
+        schedule();
+      }
+    } catch {
+      /* ignore keep-alive / non-JSON frames */
+    }
   });
 
   return {
-    origin: () => origin,
+    clear,
     resume: () => {
       paused.set(false);
       newCount.set(0);
@@ -160,7 +217,7 @@ function createIngest(
     },
     onScroll: () => {
       const el = scroller.el;
-      if (el) stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+      if (el) stick = el.scrollTop <= 8; // near the top → follow the newest rows
     },
   };
 }
@@ -171,7 +228,7 @@ function createIngest(
  * @returns {TemplateResult}
  */
 function Toolbar(s: LogState): TemplateResult {
-  const { filter, statusFilter, authFilter, visible, events, paused, newCount, resume } = s;
+  const { filter, statusFilter, authFilter, visible, events, paused, newCount, resume, clear } = s;
   const statusOpts = [
     { value: "all", label: "All status" },
     { value: "2", label: "2xx" },
@@ -189,6 +246,13 @@ function Toolbar(s: LogState): TemplateResult {
     if (paused.val) resume();
     else paused.set(true);
   };
+  // Drain the server ring (durable across reconnect + consistent across tabs),
+  // then empty this view immediately. The server's `clear` frame also lands and
+  // empties every open tab, including this one.
+  const onClear = () => {
+    void clearEvents();
+    clear();
+  };
   return html`
     <div class="toolbar split align-center pad-md border-b">
       <div class="cluster align-center gap-md">
@@ -200,8 +264,15 @@ function Toolbar(s: LogState): TemplateResult {
       </div>
       <div class="cluster align-center gap-md">
         <span class="count mono">${() => `${visible.val.length} / ${events.val.length}`}</span>
-        <button class=${() => "pause-btn" + (paused.val ? " paused" : "")} @click=${pause}>
-          ${() => (paused.val ? `▶ ${newCount.val} new` : "❚❚ Pause")}
+        <button class="clear-btn cluster align-center" @click=${onClear} title="Clear log" aria-label="Clear log">${TrashIcon()}</button>
+        <button
+          class=${() => "pause-btn cluster align-center gap-xs" + (paused.val ? " paused" : "")}
+          @click=${pause}
+          title=${() => (paused.val ? "Resume live tail" : "Pause live tail")}
+          aria-label=${() => (paused.val ? "Resume live tail" : "Pause live tail")}
+        >
+          ${() => (paused.val ? PlayIcon() : PauseIcon())}
+          ${() => (paused.val && newCount.val > 0 ? html`<span class="pause-count mono">${newCount}</span>` : "")}
         </button>
       </div>
     </div>
@@ -230,7 +301,7 @@ function LogTable(s: LogState): TemplateResult {
       <tbody>
         ${each(
           s.visible as unknown as Signal<LogEvent[]>,
-          (e) => Row(e, s.expanded, s.origin()),
+          (e) => Row(e, s.expanded, s.now),
           (e) => e.id,
         )}
       </tbody>
@@ -242,13 +313,12 @@ function LogTable(s: LogState): TemplateResult {
  * One log row plus its (conditionally rendered) detail row.
  * @returns {TemplateResult}
  */
-function Row(e: LogEvent, expanded: Signal<number | null>, origin: number): TemplateResult {
-  const elapsed = elapsedLabel(e.ts, origin);
+function Row(e: LogEvent, expanded: Signal<number | null>, now: Signal<number>): TemplateResult {
   const toggle = () => expanded.update((id) => (id === e.id ? null : e.id));
   const durCls = "c-dur" + (e.duration_ms >= SLOW_MS ? " slow" : "");
   return html`
     <tr class="log-row" @click=${toggle}>
-      <td class="c-time mono">${elapsed}</td>
+      <td class="c-time mono">${() => timeAgo(e.ts, now.val)}</td>
       <td class="c-method"><span class=${"method m-" + e.method.toLowerCase()}>${e.method}</span></td>
       <td class="c-op">${e.op ?? "—"}</td>
       <td class="c-key mono" title=${targetOf(e)}>${targetOf(e)}</td>
@@ -274,6 +344,7 @@ function Detail(e: LogEvent): TemplateResult {
   return html`
     <td colspan="7">
       <div class="detail-grid grid">
+        ${field("time", new Date(e.ts).toISOString())}
         ${field("op", e.op ?? "—")}
         ${field("auth", e.auth)}
         ${field("error_code", e.error_code ?? "—")}
@@ -282,6 +353,21 @@ function Detail(e: LogEvent): TemplateResult {
         ${field("duration", e.duration_ms + " ms")}
         ${field("id", String(e.id))}
       </div>
+      ${JumpToObject(e)}
     </td>
   `;
+}
+
+/**
+ * A "View object" deep link for a row that names a concrete object (both a
+ * bucket and a key). A same-origin `<a href>` — zero intercepts the click and
+ * routes into the bucket browser's object detail. Rows without a key
+ * (ListBuckets, CreateBucket, pre-resolution errors) render nothing.
+ * @param {LogEvent} e
+ * @returns {TemplateResult | string}
+ */
+function JumpToObject(e: LogEvent): TemplateResult | string {
+  if (!e.bucket || !e.key) return "";
+  const href = locationToUrl({ bucket: e.bucket, prefix: parentPrefix(e.key), object: e.key });
+  return html`<a class="detail-jump" href=${href}>View object →</a>`;
 }

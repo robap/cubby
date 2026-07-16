@@ -39,12 +39,20 @@ export function appendCapped(prev: LogEvent[], batch: LogEvent[], max: number): 
 }
 
 /**
- * The relative TIME label: seconds since `origin`, two decimals, clamped at 0.
+ * A human "time-ago" label for an event's wall-clock `ts` relative to `now`
+ * (both Unix ms): `now` under a second, then `5s`, `2m`, `1h`, `3d`. Coarse and
+ * monotonic — it stays readable as the log ages, unlike seconds-since-first.
  * @param {number} ts
- * @param {number} origin
+ * @param {number} now
  * @returns {string}
  */
-export function elapsedLabel(ts: number, origin: number): string {
-  const secs = Math.max(0, (ts - origin) / 1000);
-  return `${secs.toFixed(2)}s`;
+export function timeAgo(ts: number, now: number): string {
+  const secs = Math.max(0, Math.floor((now - ts) / 1000));
+  if (secs < 1) return "now";
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }

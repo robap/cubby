@@ -16,6 +16,13 @@
 }
 
 .app-body {
+  // `flank` sets `flex-wrap: wrap`; a wrapping flex container stretches its
+  // children to the *line's content height*, not the container height — which
+  // let `.app-main` grow to its content and defeated every inner scroll region
+  // (the preview, the live log). Pinning it to `nowrap` makes the single flex
+  // line take the container's bounded height, so `flex: 1` children below are
+  // height-constrained and their `overflow: auto` panes actually scroll.
+  flex-wrap: nowrap;
   min-height: 0; // let the scroll regions inside contain their overflow
   overflow: hidden;
 }
@@ -25,6 +32,14 @@
 }
 
 .screen {
+  flex: 1;
+  min-height: 0;
+}
+
+// The bucket browser's stable root wrapper (see `Browser` in routes/browser.ts):
+// a flex column that fills `.app-main` so the `flex: 1` screen inside keeps the
+// viewport-bounded height its inner scroll regions depend on.
+.browser-root {
   flex: 1;
   min-height: 0;
 }
@@ -57,6 +72,13 @@
 .brand-mark {
   color: var(--color-primary);
   font-size: var(--font-size-lg);
+
+  // The cube logo (same SVG as the favicon); `currentColor` tracks the theme.
+  svg {
+    display: block;
+    width: 1em;
+    height: 1em;
+  }
 }
 
 .brand-name {
@@ -177,10 +199,28 @@
   background: var(--color-surface);
 }
 
-.toolbar-filter,
-.search-field {
-  width: 22rem;
+.toolbar-filter {
+  width: 18rem;
   max-width: 100%;
+
+  .input {
+    width: 100%;
+  }
+}
+
+// The browser search input fills its field (no dead gap before the scope
+// toggle), and the field sits flush beside the segmented toggle in `.search-group`.
+.search-field {
+  width: 18rem;
+  max-width: 100%;
+
+  .input {
+    width: 100%;
+  }
+}
+
+.search-group {
+  min-width: 0;
 }
 
 .count {
@@ -188,24 +228,36 @@
   color: var(--color-text-muted);
 }
 
-.pause-btn,
-.all-buckets-btn {
-  border: var(--border-thin) solid var(--color-border-strong);
-  background: var(--color-surface-strong);
-  color: var(--color-text);
+// Inline SVG icons (see components/icons.ts): sized in `em` so they scale with
+// the button text and share a single box, keeping toolbar controls aligned.
+.icon {
+  display: block;
+  width: 1.15em;
+  height: 1.15em;
+}
+
+.pause-count {
+  font-size: var(--font-size-sm);
+}
+
+// Borderless icon buttons (🗑 / ❚❚ / ▶): no box in the resting state, just a
+// muted glyph that brightens on hover; the paused/active state reads as primary.
+.clear-btn,
+.pause-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
   border-radius: var(--radius-md);
-  padding: var(--space-xs) var(--space-md);
-  font-weight: var(--weight-medium);
+  padding: var(--space-xs) var(--space-sm);
   cursor: pointer;
 
   &:hover {
+    color: var(--color-text);
     background: var(--hover-bg);
   }
 
   &.paused,
   &.active {
-    background: var(--color-primary-soft);
-    border-color: var(--color-primary);
     color: var(--color-primary);
   }
 }
@@ -364,6 +416,18 @@
   }
 }
 
+.detail-jump {
+  display: inline-block;
+  margin: 0 var(--space-lg) var(--space-md);
+  color: var(--color-primary);
+  font-size: var(--font-size-sm);
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
 // ── Empty states ──────────────────────────────────────────────────────────
 .empty-state {
   height: 100%;
@@ -381,22 +445,55 @@
 // browser-screen is a `flank`: the buckets column (fixed) beside the listing
 // pane (fills). SCSS carries only the column width, scroll, and divider.
 .browser-screen {
+  // `flank` sets `flex-wrap: wrap`; a wrapping flex line grows to its children's
+  // content height instead of the (viewport-bounded) container height, so the
+  // buckets column and listing pane stretched past the screen and their
+  // `overflow-y: auto` never engaged on a short window. `nowrap` pins the single
+  // line to the container height so both panes become height-constrained and
+  // scroll. (Same shell-height fix as `.app-body`.)
+  flex-wrap: nowrap;
   min-height: 0;
 }
 
+// The column is a flex stack: a fixed header (BUCKETS + the `+` toggle) and,
+// optionally, the new-bucket form, above a `.buckets-list` that scrolls. Keeping
+// scroll on the list (not the column) leaves the header and form pinned.
 .buckets-col {
   width: 15rem;
   border-right: var(--border-thin) solid var(--color-border);
-  overflow-y: auto;
-  padding: var(--space-sm);
-  gap: var(--space-xs);
 }
 
+.buckets-head {
+  flex-shrink: 0;
+}
+
+.buckets-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+// A borderless `+` beside the BUCKETS label; toggles the inline name field.
+.new-bucket-add {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+
+  &:hover,
+  &.active {
+    color: var(--color-primary);
+  }
+}
+
+// A bucket card: a 🪣 glyph beside a name-over-metadata stack. The name and the
+// `N objects · size` line each ellipsize rather than wrap (the pane is narrow),
+// so the size never breaks onto its own line.
 .bucket-row {
-  gap: var(--space-xs);
   width: 100%;
   padding: var(--space-sm) var(--space-md);
-  border: none;
+  border: var(--border-thin) solid transparent;
   background: transparent;
   border-radius: var(--radius-md);
   cursor: pointer;
@@ -407,6 +504,7 @@
 
   &.active {
     background: var(--color-primary-soft);
+    border-color: var(--color-primary);
 
     .bucket-name {
       color: var(--color-primary);
@@ -414,28 +512,32 @@
   }
 }
 
-.new-bucket-btn {
-  width: 100%;
-  border: var(--border-thin) dashed var(--color-border-strong);
-  background: transparent;
-  color: var(--color-text-muted);
-  border-radius: var(--radius-md);
-  padding: var(--space-sm) var(--space-md);
-  cursor: pointer;
+// The head line: 🪣 flanking the bucket name. The metadata line lives outside
+// it (a full-width sibling) so `N objects · size` gets the whole card width and
+// never truncates just to sit beside the icon.
+.bucket-head {
+  min-width: 0; // let the name ellipsize rather than widen the card
+}
 
-  &:hover {
-    color: var(--color-primary);
-    border-color: var(--color-primary);
-  }
+.bucket-icon {
+  flex-shrink: 0;
+  font-size: var(--font-size-md);
+  line-height: var(--leading-tight);
 }
 
 .bucket-name {
   font-weight: var(--weight-semi);
   color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bucket-sub {
   font-size: var(--font-size-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .listing-pane {
@@ -542,6 +644,11 @@ mark {
 }
 
 // ── Object detail ─────────────────────────────────────────────────────────
+// The element carries the `stack` primitive (a real flex column — the `flex-col`
+// utility only sets `flex-direction`, not `display: flex`), so `.detail-body`
+// below gets a *bounded* height to contain its scroll region. Without a flex
+// column here the preview grows unbounded and is clipped by the app shell
+// instead of scrolling.
 .detail-screen {
   min-height: 0;
 }
@@ -575,6 +682,11 @@ mark {
   overflow: hidden;
 }
 
+// A bounded flex column (the `stack` primitive on the element) that is the
+// single vertical scroller: a `<pre>` taller than the pane scrolls from its
+// first line, nothing clipped, while a short preview or an image is centered via
+// `margin: auto`. (The previous `align-center` centered tall content and pushed
+// its top out of reach.)
 .preview-pane {
   flex: 1;
   min-width: 0;
@@ -582,7 +694,10 @@ mark {
   overflow: auto;
 }
 
+// `margin: auto` centers the image in both axes when there is room, and — since
+// it is capped to the pane — it is never clipped.
 .preview-img {
+  margin: auto;
   max-width: 100%;
   max-height: 100%;
   border-radius: var(--radius-md);
@@ -591,8 +706,6 @@ mark {
 
 .preview-text {
   width: 100%;
-  max-height: 100%;
-  overflow: auto;
   font-size: var(--font-size-sm);
   padding: var(--space-md);
   border-radius: var(--radius-md);

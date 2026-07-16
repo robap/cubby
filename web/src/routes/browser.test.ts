@@ -177,6 +177,21 @@ describe("Browser", () => {
     expect(tags).toEqual(["demo", "other"]);
   });
 
+  it("shows a This-bucket/All-buckets scope toggle and flips scope on click", () => {
+    selectedBucket.set("demo");
+    folder.set(folderView());
+    const el = render(Browser());
+    const segs = findAll(el, ".seg-btn");
+    expect(segs.map((b) => text(b))).toEqual(["This bucket", "All buckets"]);
+    // Default scope is this-bucket; the active segment reflects the store.
+    expect(text(find(el, ".seg-btn.active")!)).toBe("This bucket");
+    fire(segs[1]!, "click"); // → All buckets
+    expect(allBuckets.val).toBe(true);
+    expect(text(find(el, ".seg-btn.active")!)).toBe("All buckets");
+    fire(segs[0]!, "click"); // → back to This bucket
+    expect(allBuckets.val).toBe(false);
+  });
+
   it("drills into a folder on click and reloads the listing", async () => {
     selectedBucket.set("app-assets");
     folder.set(folderView({ common_prefixes: ["css/"], objects: [] }));
@@ -216,6 +231,26 @@ describe("Browser", () => {
     ...over,
   });
 
+  it("wraps the view in a single stable root element across the branch flip", () => {
+    // The BrowseView↔ObjectDetail choice must live inside one stable
+    // `.browser-root`, not at the component root: zero's router rebuilds this
+    // component on every `/_/browser` navigation and swaps it into the layout
+    // outlet, and a bare root binding desyncs with an in-app `selectedObject`
+    // flip — orphaning a duplicate screen. The wrapper is what the outlet owns.
+    selectedBucket.set("app-assets");
+    folder.set(folderView());
+    const el = render(Browser());
+    expect(findAll(el, ".browser-root").length).toBe(1);
+    expect(findAll(el, ".browser-screen").length).toBe(1);
+    expect(findAll(el, ".detail-screen").length).toBe(0);
+    // Flip to the detail branch in place: still exactly one root, one screen.
+    selectedObject.set("images/hero/landing-1x.png");
+    objectMeta.set(meta());
+    expect(findAll(el, ".browser-root").length).toBe(1);
+    expect(findAll(el, ".detail-screen").length).toBe(1);
+    expect(findAll(el, ".browser-screen").length).toBe(0);
+  });
+
   it("renders the metadata tables and an image preview", () => {
     selectedBucket.set("app-assets");
     selectedObject.set("images/hero/landing-1x.png");
@@ -228,6 +263,21 @@ describe("Browser", () => {
     expect(text(el, ".detail-screen")).toContain("x-amz-meta-uploaded-by");
     // Image type → an <img> preview, not a text pane.
     expect(find(el, ".preview-img")).not.toBe(null);
+  });
+
+  it("pretty-prints a minified JSON object in the preview pane", async () => {
+    selectedBucket.set("demo");
+    selectedObject.set("data.json");
+    objectMeta.set(meta({ key: "data.json", content_type: "application/json", size: 20 }));
+    // The preview fetch streams the raw (minified) bytes back via `text()`.
+    stubFetch(() => '{"a":1,"b":2}');
+    const el = render(Browser());
+    await tick();
+    const pre = find(el, ".preview-text");
+    expect(pre).not.toBe(null);
+    // Re-indented on its own lines, not one long run.
+    expect(text(pre!)).toContain('"a": 1');
+    expect(text(pre!).split("\n").length).toBeGreaterThan(1);
   });
 
   it("mints a presigned URL on Generate and shows it", async () => {
@@ -259,14 +309,25 @@ describe("Browser", () => {
       return { buckets: [{ name: "newb", created_at: "2026-07-11T00:00:00Z", object_count: 0, size: 0 }] };
     });
     const el = render(Browser());
-    fire(findAll(el, "button").find((b) => text(b).includes("New bucket"))!, "click");
-    const input = find(el, ".new-bucket input") as HTMLInputElement;
+    // The `+` toggle lives in the BUCKETS header; it reveals the inline form.
+    fire(find(el, ".new-bucket-add")!, "click");
+    const input = find(el, ".new-bucket-form input") as HTMLInputElement;
     input.value = "newb";
     fire(input, "input");
     fire(findAll(el, "button").find((b) => text(b) === "Create")!, "click");
     await tick();
     expect(stub.calls.some((c) => c.method === "POST" && c.url.includes("/_/api/buckets"))).toBe(true);
     expect(selectedBucket.val).toBe("newb");
+  });
+
+  it("dismisses the new-bucket form on Escape", () => {
+    buckets.set([bucket()]);
+    const el = render(Browser());
+    fire(find(el, ".new-bucket-add")!, "click");
+    expect(find(el, ".new-bucket-form")).not.toBe(null);
+    // Escape anywhere in the form closes it without creating a bucket.
+    fire(find(el, ".new-bucket-form input")!, "keydown", { key: "Escape" });
+    expect(find(el, ".new-bucket-form")).toBe(null);
   });
 
   it("keeps the search input's DOM node across a search (no focus loss)", async () => {

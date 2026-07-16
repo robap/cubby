@@ -53,6 +53,15 @@ pub struct Event {
     pub error_code: Option<String>,
 }
 
+/// What travels on the broadcast channel to live subscribers: either a newly
+/// recorded [`Event`], or a `Clear` directive (the ring was drained, so live
+/// consumers should empty their view too — see [`EventBus::clear`]).
+#[derive(Clone, Debug)]
+pub enum BusSignal {
+    Event(Event),
+    Clear,
+}
+
 /// Everything the logging wrapper knows before the bus stamps an `id`/`ts`.
 #[derive(Clone, Debug)]
 pub struct EventDraft {
@@ -75,7 +84,7 @@ const RING_CAPACITY: usize = 1000;
 const CHANNEL_CAPACITY: usize = 1024;
 
 struct Inner {
-    tx: broadcast::Sender<Event>,
+    tx: broadcast::Sender<BusSignal>,
     ring: Mutex<VecDeque<Event>>,
     next_id: AtomicU64,
     capacity: usize,
@@ -131,14 +140,29 @@ impl EventBus {
         }
         ring.push_back(event.clone());
         // Ignore the "no live subscribers" error — the ring still retains it.
-        let _ = self.inner.tx.send(event.clone());
+        let _ = self.inner.tx.send(BusSignal::Event(event.clone()));
         event
     }
 
-    /// Subscribe for live events, returning the replay backlog first. `after`
+    /// Drain the ring buffer and tell live subscribers to clear. Held under the
+    /// ring lock (as [`emit`] is) so no event can slip between the drain and the
+    /// `Clear` signal: after this a fresh [`subscribe`] sees an empty backlog,
+    /// and connected streams receive a `Clear` so they empty their view too —
+    /// making the clear durable across `EventSource` reconnect and consistent
+    /// across open tabs.
+    ///
+    /// [`emit`]: EventBus::emit
+    /// [`subscribe`]: EventBus::subscribe
+    pub fn clear(&self) {
+        let mut ring = self.inner.ring.lock().expect("event ring poisoned");
+        ring.clear();
+        let _ = self.inner.tx.send(BusSignal::Clear);
+    }
+
+    /// Subscribe for live signals, returning the replay backlog first. `after`
     /// filters the backlog to events with `id > after` (the `Last-Event-ID`
     /// resume point); `None` replays the whole buffer.
-    pub fn subscribe(&self, after: Option<u64>) -> (Vec<Event>, broadcast::Receiver<Event>) {
+    pub fn subscribe(&self, after: Option<u64>) -> (Vec<Event>, broadcast::Receiver<BusSignal>) {
         let ring = self.inner.ring.lock().expect("event ring poisoned");
         let rx = self.inner.tx.subscribe();
         let backlog: Vec<Event> = ring
@@ -255,9 +279,31 @@ mod tests {
         let bus = EventBus::new();
         let (_backlog, mut rx) = bus.subscribe(None);
         let emitted = bus.emit(draft("GET", Some("GetObject")));
-        let received = rx.recv().await.unwrap();
-        assert_eq!(received.id, emitted.id);
-        assert_eq!(received.op.as_deref(), Some("GetObject"));
+        match rx.recv().await.unwrap() {
+            BusSignal::Event(received) => {
+                assert_eq!(received.id, emitted.id);
+                assert_eq!(received.op.as_deref(), Some("GetObject"));
+            }
+            BusSignal::Clear => panic!("expected an Event signal, got Clear"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_empties_the_ring_and_signals_live_subscribers() {
+        let bus = EventBus::new();
+        bus.emit(draft("PUT", Some("PutObject")));
+        let (_backlog, mut rx) = bus.subscribe(None);
+
+        bus.clear();
+
+        // The next subscriber's backlog is empty (the ring was drained).
+        let (backlog, _rx2) = bus.subscribe(None);
+        assert!(backlog.is_empty(), "ring is empty after clear");
+        // The already-connected subscriber is told to clear.
+        match rx.recv().await.unwrap() {
+            BusSignal::Clear => {}
+            BusSignal::Event(e) => panic!("expected Clear, got Event {}", e.id),
+        }
     }
 
     #[test]

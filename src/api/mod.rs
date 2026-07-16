@@ -41,6 +41,7 @@ pub async fn dispatch(req: hyper::Request<Incoming>, state: &Arc<AppState>) -> R
     match (&method, sub.as_str()) {
         (&Method::GET, "health") => health::health(state, &req),
         (&Method::GET, "events") => events::stream(&req, state),
+        (&Method::POST, "events/clear") => events::clear(state),
         (&Method::GET, "buckets") => buckets::list(state),
         (&Method::POST, "buckets") => buckets::create(req, state).await,
         (&Method::GET, "search") => search::search(&req, state),

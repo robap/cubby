@@ -11,8 +11,9 @@ import { HttpError } from "zero/http";
 import type { BucketInfo, ObjectInfo, SearchHit } from "../lib/api.ts";
 import { contentUrl } from "../lib/api.ts";
 import { crumbs, folderLabel, highlightParts, viewMode } from "../lib/browse.ts";
-import { baseName, fmtDate, humanBytes } from "../lib/format.ts";
+import { baseName, fmtDate, humanBytes, truncateEnd } from "../lib/format.ts";
 import ObjectDetail from "../components/object-detail.ts";
+import { ArchiveIcon, BucketIcon, DownloadIcon, FileIcon, FolderIcon, PlusIcon, TrashIcon } from "../components/icons.ts";
 import {
   allBuckets,
   buckets,
@@ -39,10 +40,18 @@ export function load(): Promise<void> {
 }
 
 /**
+ * The bucket browser route. The BrowseView↔ObjectDetail choice sits inside a
+ * *stable* root element rather than at the component's root: zero's router
+ * rebuilds this component on every `/_/browser` navigation (including query-only
+ * changes) and swaps the result into the layout outlet, while an in-app open
+ * (`openObject`) also flips `selectedObject` in the currently-mounted tree. With
+ * a bare root binding those two DOM operations desync and orphan a screen (the
+ * detail view rendered twice); a stable wrapper the outlet owns is removed whole
+ * on the swap, so exactly one screen survives.
  * @returns {TemplateResult}
  */
 export default function Browser(): TemplateResult {
-  return html`${() => (selectedObject.val ? ObjectDetail() : BrowseView())}`;
+  return html`<div class="browser-root stack gap-0">${() => (selectedObject.val ? ObjectDetail() : BrowseView())}</div>`;
 }
 
 /**
@@ -59,61 +68,72 @@ function BrowseView(): TemplateResult {
 }
 
 /**
- * The middle column: every bucket with its object count and size.
+ * The middle column: a fixed BUCKETS header with a `+` new-bucket toggle, then a
+ * scrolling list of buckets (each with its object count and size). Keeping `+`
+ * in the header — rather than after the list — leaves it reachable when the list
+ * is long. The inline name field opens just under the header (also always
+ * visible) and is dismissable with Escape.
  * @returns {TemplateResult}
  */
 function BucketsColumn(): TemplateResult {
-  const row = (b: BucketInfo) => {
-    const cls = () => "bucket-row flex-col text-start" + (selectedBucket.val === b.name ? " active" : "");
-    const size = b.object_count > 0 ? humanBytes(b.size) : "—";
-    return html`
-      <button class=${cls} @click=${() => selectBucket(b.name)}>
-        <span class="bucket-name mono">${b.name}</span>
-        <span class="bucket-sub mono muted">${b.object_count} objects · ${size}</span>
-      </button>
-    `;
-  };
-  return html`
-    <div class="buckets-col stack">
-      <div class="section-label pad-sm">BUCKETS</div>
-      ${each(buckets, row, (b) => b.name)}
-      ${NewBucket()}
-    </div>
-  `;
-}
-
-/**
- * The "+ New bucket" affordance: a button that reveals an inline name field;
- * submitting creates the bucket (surfacing a 400/409 message on failure).
- * @returns {TemplateResult}
- */
-function NewBucket(): TemplateResult {
   const open = signal(false);
   const name = signal("");
   const error = signal<string | null>(null);
+  const close = () => {
+    open.set(false);
+    name.set("");
+    error.set(null);
+  };
   const submit = async () => {
     const trimmed = name.val.trim();
     if (!trimmed) return;
     try {
       await createBucket(trimmed);
-      name.set("");
-      error.set(null);
-      open.set(false);
+      close();
     } catch (e) {
       error.set(errorMessage(e));
     }
   };
+  const row = (b: BucketInfo) => {
+    const cls = () => "bucket-row stack gap-0 text-start" + (selectedBucket.val === b.name ? " active" : "");
+    const size = b.object_count > 0 ? humanBytes(b.size) : "—";
+    return html`
+      <button class=${cls} @click=${() => selectBucket(b.name)}>
+        <span class="bucket-head flank align-center gap-sm">
+          <span class="bucket-icon" aria-hidden="true">${BucketIcon()}</span>
+          <span class="bucket-name mono">${b.name}</span>
+        </span>
+        <span class="bucket-sub mono muted">${b.object_count} objects · ${size}</span>
+      </button>
+    `;
+  };
   return html`
-    <div class="new-bucket stack gap-xs pad-sm">
+    <div class="buckets-col stack gap-0">
+      <div class="buckets-head split align-center pad-sm border-b">
+        <span class="section-label">BUCKETS</span>
+        <button
+          class=${() => "new-bucket-add cluster align-center justify-center" + (open.val ? " active" : "")}
+          @click=${() => (open.val ? close() : open.set(true))}
+          title="New bucket"
+          aria-label="New bucket"
+        >${PlusIcon()}</button>
+      </div>
       ${() =>
         open.val
           ? html`
-              <form class="cluster align-center gap-sm" @submit=${(e: Event) => { e.preventDefault(); submit(); }}>
+              <form
+                class="new-bucket-form cluster align-center gap-sm pad-sm border-b"
+                @submit=${(e: Event) => { e.preventDefault(); submit(); }}
+                @keydown=${(e: KeyboardEvent) => { if (e.key === "Escape") close(); }}
+              >
                 ${Input({ value: name, placeholder: "bucket-name", size: "sm", autofocus: true, error })}
                 <button class="button button-primary button-sm" type="button" @click=${submit}>Create</button>
               </form>
             `
-          : html`<button class="new-bucket-btn" @click=${() => open.set(true)}>+ New bucket</button>`}
+          : ""}
+      <div class="buckets-list stack gap-xs pad-sm">
+        ${each(buckets, row, (b) => b.name)}
+      </div>
     </div>
   `;
 }
@@ -152,7 +172,7 @@ function ListingPane(): TemplateResult {
   const onDragLeave = () => dragging.set(false);
   return html`
     <div
-      class=${() => "listing-pane flex-col" + (dragging.val ? " dragging" : "")}
+      class=${() => "listing-pane stack gap-0" + (dragging.val ? " dragging" : "")}
       @drop=${onDrop}
       @dragover=${onDragOver}
       @dragleave=${onDragLeave}
@@ -165,7 +185,10 @@ function ListingPane(): TemplateResult {
 }
 
 /**
- * The search box + "all buckets" scope toggle.
+ * The search box paired with a "This bucket / All buckets" scope toggle. The two
+ * sit in one `.search-group` so they read as a single control: the segmented
+ * toggle names what the search covers, replacing the old lone "all buckets"
+ * button whose scope was unclear.
  * @returns {TemplateResult}
  */
 function SearchToolbar(): TemplateResult {
@@ -178,14 +201,23 @@ function SearchToolbar(): TemplateResult {
   const box = signal("");
   effect(() => box.set(searchTerm.val));
   const onInput = (v: string) => setSearch(v);
-  const scopeCls = () => "all-buckets-btn" + (allBuckets.val ? " active" : "");
+  // Two-state segment: clicking the inactive side flips scope (and re-runs any
+  // active search); clicking the active side is a no-op.
+  const scopeBtn = (label: string, all: boolean) => html`
+    <button
+      class=${() => "seg-btn" + (allBuckets.val === all ? " active" : "")}
+      @click=${() => { if (allBuckets.val !== all) toggleAllBuckets(); }}
+    >${label}</button>
+  `;
   return html`
     <div class="listing-toolbar split align-center pad-md border-b">
-      <div class="cluster align-center gap-md">
+      <div class="search-group cluster align-center gap-sm">
         <div class="search-field">
           ${Input({ value: box, placeholder: "Search keys…", size: "sm", onChange: onInput, debounceMs: 150 })}
         </div>
-        <button class=${scopeCls} @click=${toggleAllBuckets}>all buckets</button>
+        <div class="segmented cluster" title="Search scope">
+          ${scopeBtn("This bucket", false)}${scopeBtn("All buckets", true)}
+        </div>
       </div>
       <span class="mono muted">
         ${() => {
@@ -269,7 +301,7 @@ function FolderTable(commonPrefixes: string[], objects: ObjectInfo[]): TemplateR
 function FolderRow(label: string, fullPrefix: string): TemplateResult {
   return html`
     <tr class="listing-row folder-row" @click=${() => navigateTo(fullPrefix)}>
-      <td class="c-name"><span class="cluster align-center gap-sm"><span class="folder-icon" aria-hidden="true">📁</span><span class="mono">${label}</span></span></td>
+      <td class="c-name"><span class="cluster align-center gap-sm"><span class="folder-icon" aria-hidden="true">${FolderIcon()}</span><span class="mono">${label}</span></span></td>
       <td class="c-size mono muted">—</td>
       <td class="c-mod mono muted">—</td>
       <td class="c-etag mono muted">—</td>
@@ -292,15 +324,15 @@ function ObjectRow(o: ObjectInfo): TemplateResult {
   return html`
     <tr class="listing-row object-row">
       <td class="c-name" @click=${open}>
-        <span class="cluster align-center gap-sm"><span class="file-icon" aria-hidden="true">📄</span><span class="mono link">${baseName(o.key)}</span></span>
+        <span class="cluster align-center gap-sm"><span class="file-icon" aria-hidden="true">${FileIcon()}</span><span class="mono link">${baseName(o.key)}</span></span>
       </td>
       <td class="c-size mono">${humanBytes(o.size)}</td>
       <td class="c-mod mono muted">${fmtDate(o.last_modified)}</td>
       <td class="c-etag mono muted">
         <span class="cluster align-center gap-sm">
-          <span class="etag-val">${o.etag}</span>
-          <a class="row-action row-download" href=${contentUrl(bucket, o.key)} download title="Download">↓</a>
-          <button class="row-action row-delete" @click=${() => removeObject(o.key)} title="Delete">✕</button>
+          <span class="etag-val" title=${o.etag}>${truncateEnd(o.etag, 10)}</span>
+          <a class="row-action row-download" href=${contentUrl(bucket, o.key)} download title="Download" aria-label="Download">${DownloadIcon()}</a>
+          <button class="row-action row-delete" @click=${() => removeObject(o.key)} title="Delete" aria-label="Delete">${TrashIcon()}</button>
         </span>
       </td>
     </tr>
@@ -314,7 +346,7 @@ function ObjectRow(o: ObjectInfo): TemplateResult {
 function EmptyState(): TemplateResult {
   return html`
     <div class="empty-state text-center stack gap-sm align-center justify-center">
-      <div class="empty-icon" aria-hidden="true">🗃️</div>
+      <div class="empty-icon" aria-hidden="true">${ArchiveIcon()}</div>
       <div>No objects yet.</div>
       <div class="muted">Drop files to upload to <span class="mono">${() => `${selectedBucket.val ?? ""}/${prefix.val}`}</span></div>
     </div>

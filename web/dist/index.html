@@ -6,12 +6,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
   <title>cubby</title>
+  <!-- No-flash theme bootstrap: stamp data-theme before first paint from the
+       persisted preference ("cubby:theme"), falling back to the OS setting.
+       Must stay in sync with stores/chrome.ts (key + resolution). -->
+  <script>
+    (function () {
+      try {
+        var p = localStorage.getItem("cubby:theme");
+        var t = (p === "dark" || p === "light") ? p
+          : (window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) { /* storage/matchMedia unavailable */ }
+    })();
+  </script>
   <!-- Inline data-URI favicon: keeps the browser from requesting /favicon.ico,
        which would hit the S3 service (403) and pollute the live request log. -->
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%236366f1' d='M8 1 14 4.5v7L8 15 2 11.5v-7z'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%236366f1' d='M8 1 14 4.5 8 8 2 4.5Z'/%3E%3Cpath fill='%236366f1' opacity='.78' d='M2 4.5 8 8 8 15 2 11.5Z'/%3E%3Cpath fill='%236366f1' opacity='.55' d='M14 4.5 14 11.5 8 15 8 8Z'/%3E%3C/svg%3E">
 
-  <link rel="stylesheet" href="/assets/app.5dd6bdc5.css">
-<script type="module" src="/assets/app.aa6330a9.js"></script>
+  <link rel="stylesheet" href="/assets/app.b170e8b9.css">
+<script type="module" src="/assets/app.3dcb0960.js"></script>
 </head>
 <body>
   <div id="app"></div>

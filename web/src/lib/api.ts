@@ -97,6 +97,11 @@ export function getHealth(): Promise<Health> {
   return http.get<Health>("/_/api/health");
 }
 
+/** `POST /_/api/events/clear` — drain the server-side live-log ring. */
+export function clearEvents(): Promise<unknown> {
+  return http.post("/_/api/events/clear", {});
+}
+
 /** `GET /_/api/buckets` */
 export function listBuckets(): Promise<{ buckets: BucketInfo[] }> {
   return http.get<{ buckets: BucketInfo[] }>("/_/api/buckets");

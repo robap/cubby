@@ -225,10 +225,12 @@ async fn ui_upload_and_delete_are_real_and_unlogged() {
     // Neither the UI upload nor delete appears in the live log — only the SDK's
     // GetObject above (decision #2). Drain the ring and assert no UI mutation.
     let mut ops = Vec::new();
-    while let Ok(Ok(ev)) =
+    while let Ok(Ok(signal)) =
         tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await
     {
-        ops.push((ev.op.clone(), ev.key.clone()));
+        if let cubby::events::BusSignal::Event(ev) = signal {
+            ops.push((ev.op.clone(), ev.key.clone()));
+        }
     }
     assert!(
         !ops.iter().any(|(op, _)| op.as_deref() == Some("PutObject")),

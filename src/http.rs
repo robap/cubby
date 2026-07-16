@@ -99,6 +99,23 @@ impl hyper::service::Service<hyper::Request<Incoming>> for Router {
             let state = self.state.clone();
             return Box::pin(async move { Ok(serve_ui(req, state).await) });
         }
+        // Browser probes like `/.well-known/appspecific/com.chrome.devtools.json`
+        // and `/favicon.ico` are never S3 traffic; short-circuit them with a `404`
+        // before the log/S3 path so they never emit an event or a pretty stdout
+        // line. (The web UI's own tab icon is an inline data-URI in `index.html`.)
+        if is_browser_probe(path) {
+            return Box::pin(async { Ok(empty_status(hyper::StatusCode::NOT_FOUND)) });
+        }
+        // A bare `GET /` from a human's browser (asks for HTML, no SigV4) is the
+        // documented front door → redirect to the UI. This is a pure routing
+        // decision: no event is logged. Everything else at `/` (a signed
+        // ListBuckets, or any non-HTML request) falls through to the S3 handler.
+        if req.method() == hyper::Method::GET
+            && path == "/"
+            && looks_like_browser(req.headers(), req.uri().query())
+        {
+            return Box::pin(async { Ok(redirect_to_ui()) });
+        }
         let s3 = self.s3.clone();
         let state = self.state.clone();
         Box::pin(log_and_serve_s3(s3, state, req))
@@ -294,6 +311,50 @@ fn pct_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Whether a path is browser-probe noise that is never real S3 traffic — a
+/// `/.well-known/…` discovery probe or the `/favicon.ico` tab-icon request.
+/// Matched at the root so a bucket key that merely embeds the literal deeper in
+/// its path is unaffected.
+fn is_browser_probe(path: &str) -> bool {
+    path == "/favicon.ico" || path.starts_with("/.well-known/")
+}
+
+/// Whether a bare-root request is a human's browser: it asks for HTML
+/// (`Accept: text/html`) and presents no SigV4 auth (no `Authorization` header,
+/// no `X-Amz-*` query params). A real S3 client never asks for HTML, so keying
+/// on `Accept` stays correct even under accept-any-credentials mode.
+fn looks_like_browser(headers: &hyper::HeaderMap, query: Option<&str>) -> bool {
+    let accepts_html = headers
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    if !accepts_html || headers.contains_key(hyper::header::AUTHORIZATION) {
+        return false;
+    }
+    let has_sigv4_query = query.is_some_and(|q| {
+        q.split('&')
+            .any(|pair| pair.split('=').next().unwrap_or(pair).starts_with("X-Amz-"))
+    });
+    !has_sigv4_query
+}
+
+/// An empty-body response with the given status (browser-probe short-circuit).
+fn empty_status(status: hyper::StatusCode) -> HttpResponse {
+    hyper::Response::builder()
+        .status(status)
+        .body(s3s::Body::empty())
+        .expect("empty status response builds")
+}
+
+/// A `302` redirect to the web UI (the bare-root browser front door).
+fn redirect_to_ui() -> HttpResponse {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::FOUND)
+        .header(hyper::header::LOCATION, "/_/")
+        .body(s3s::Body::empty())
+        .expect("redirect response builds")
+}
+
 /// Serve a `/_/…` request: the JSON/SSE API, a real embedded asset, or the SPA
 /// shell (`index.html`) as the fallback for client-side routes.
 async fn serve_ui(req: hyper::Request<Incoming>, state: Arc<AppState>) -> HttpResponse {
@@ -411,5 +472,52 @@ mod tests {
             Some("SignatureDoesNotMatch")
         );
         assert_eq!(parse_error_code(b"not xml"), None);
+    }
+
+    #[test]
+    fn is_browser_probe_matches_well_known_and_favicon() {
+        assert!(is_browser_probe(
+            "/.well-known/appspecific/com.chrome.devtools.json"
+        ));
+        assert!(is_browser_probe("/.well-known/security.txt"));
+        // The browser's tab-icon probe — never S3 traffic.
+        assert!(is_browser_probe("/favicon.ico"));
+        // Not a probe: the root, the UI namespace, or a bucket that merely
+        // happens to embed the literal deeper in a key/path.
+        assert!(!is_browser_probe("/"));
+        assert!(!is_browser_probe("/_/browser"));
+        assert!(!is_browser_probe("/demo/.well-known/x"));
+        assert!(!is_browser_probe("/demo/favicon.ico"));
+    }
+
+    #[test]
+    fn looks_like_browser_requires_html_and_no_sigv4() {
+        use hyper::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
+
+        let mut html = HeaderMap::new();
+        html.insert(
+            ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml"),
+        );
+        assert!(looks_like_browser(&html, None));
+        // A harmless (non-SigV4) query does not disqualify a browser.
+        assert!(looks_like_browser(&html, Some("foo=bar")));
+
+        // No `Accept: text/html` → a real S3 client, never redirected.
+        assert!(!looks_like_browser(&HeaderMap::new(), None));
+
+        // Header SigV4 → signed, not a bare browser hit.
+        let mut signed = html.clone();
+        signed.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=local/..."),
+        );
+        assert!(!looks_like_browser(&signed, None));
+
+        // Presigned (query SigV4) → not redirected either.
+        assert!(!looks_like_browser(
+            &html,
+            Some("X-Amz-Signature=abc&X-Amz-Date=x")
+        ));
     }
 }

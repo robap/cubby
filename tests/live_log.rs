@@ -6,7 +6,7 @@ mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::TestServer;
-use cubby::events::{Auth, Event};
+use cubby::events::{Auth, BusSignal, Event};
 use futures::StreamExt;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{timeout, Duration};
@@ -37,16 +37,18 @@ async fn read_until(resp: reqwest::Response, pred: impl Fn(&str) -> bool) -> Str
     }
 }
 
-/// Pull events until one matches `pred` (or time out). Tolerates `Lagged`.
-async fn recv_matching(rx: &mut Receiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
+/// Pull events until one matches `pred` (or time out). Tolerates `Lagged` and
+/// skips `Clear` signals.
+async fn recv_matching(rx: &mut Receiver<BusSignal>, pred: impl Fn(&Event) -> bool) -> Event {
     let deadline = Duration::from_secs(5);
     loop {
         match timeout(deadline, rx.recv()).await {
-            Ok(Ok(ev)) => {
+            Ok(Ok(BusSignal::Event(ev))) => {
                 if pred(&ev) {
                     return ev;
                 }
             }
+            Ok(Ok(BusSignal::Clear)) => continue,
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(e)) => panic!("event stream closed: {e}"),
             Err(_) => panic!("timed out waiting for a matching event"),
@@ -278,6 +280,62 @@ async fn last_event_id_replays_only_newer_events() {
         "replayed ids {replayed:?} must all be > {cutoff}"
     );
     assert!(replayed.contains(&(cutoff + 1)), "replay includes cutoff+1");
+}
+
+// Box B.clear — `POST /_/api/events/clear` drains the ring and pushes a `clear`
+// frame to a connected live stream.
+#[tokio::test]
+async fn clear_endpoint_drains_ring_and_signals_live_stream() {
+    let server = TestServer::spawn().await;
+    let s3 = server.client();
+    s3.create_bucket().bucket("demo").send().await.unwrap();
+    s3.put_object()
+        .bucket("demo")
+        .key("before-clear")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+
+    // Open a live ndjson stream (it replays the backlog, then streams live).
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/_/api/events?format=ndjson", base(&server)))
+        .send()
+        .await
+        .unwrap();
+
+    // Clearing pushes a `{"clear":true}` frame to the connected stream…
+    let clear = http
+        .post(format!("{}/_/api/events/clear", base(&server)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clear.status(), 204);
+    let buf = read_until(resp, |b| b.contains("\"clear\":true")).await;
+    assert!(
+        buf.contains("before-clear"),
+        "backlog replayed first: {buf}"
+    );
+
+    // …and a fresh subscriber sees an empty backlog (ring drained).
+    let resp2 = http
+        .get(format!("{}/_/api/events?format=ndjson", base(&server)))
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("demo")
+        .key("after-clear")
+        .body(ByteStream::from_static(b"y"))
+        .send()
+        .await
+        .unwrap();
+    let buf2 = read_until(resp2, |b| b.contains("after-clear")).await;
+    assert!(
+        !buf2.contains("before-clear"),
+        "pre-clear events are gone from the ring: {buf2}"
+    );
 }
 
 // THE headline (seam substance) — a multipart upload decomposes into the three

@@ -4,7 +4,16 @@
 
 import { html, route } from "zero";
 import type { TemplateResult } from "zero";
-import { health, healthy, theme, toggleTheme } from "../stores/chrome.ts";
+import { middleTruncate } from "../lib/format.ts";
+import { MoonIcon, SunIcon, SystemIcon } from "./icons.ts";
+import { cycleTheme, health, healthy, themePref } from "../stores/chrome.ts";
+
+/** Icon + label per theme preference, so the control reflects the current one. */
+const THEME_DISPLAY = {
+  dark: { icon: MoonIcon, label: "Dark" },
+  light: { icon: SunIcon, label: "Light" },
+  system: { icon: SystemIcon, label: "System" },
+} as const;
 
 /**
  * The top bar. Reads the health store for the data-dir / endpoint / status dot.
@@ -15,17 +24,20 @@ function TopBar(): TemplateResult {
     <header class="topbar split align-center pad-md border-b">
       <div class="cluster align-center gap-lg">
         <div class="cluster align-center gap-sm">
-          <span class="brand-mark" aria-hidden="true">◆</span>
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 16 16">
+              <path fill="currentColor" d="M8 1 14 4.5 8 8 2 4.5Z"></path>
+              <path fill="currentColor" opacity="0.78" d="M2 4.5 8 8 8 15 2 11.5Z"></path>
+              <path fill="currentColor" opacity="0.55" d="M14 4.5 14 11.5 8 15 8 8Z"></path>
+            </svg>
+          </span>
           <span class="brand-name text-h4">cubby</span>
           <span class="badge-version mono">${() => "v" + (health.val?.version ?? "…")}</span>
         </div>
         <div class="cluster align-center gap-xs">
           <span class="chrome-label">DATA-DIR</span>
-          <span class="chrome-value mono">${() => health.val?.data_dir ?? "…"}</span>
-        </div>
-        <div class="cluster align-center gap-xs">
-          <span class="chrome-label">ENDPOINT</span>
-          <span class="chrome-value mono">${() => health.val?.endpoint ?? "…"}</span>
+          <span class="chrome-value mono" title=${() => health.val?.data_dir ?? ""}
+            >${() => middleTruncate(health.val?.data_dir ?? "…", 50)}</span>
         </div>
       </div>
       <div class="cluster align-center gap-md">
@@ -34,11 +46,12 @@ function TopBar(): TemplateResult {
           <span class="status-text">${() => (healthy.val ? "healthy" : "offline")}</span>
         </span>
         <button
-          class="theme-toggle"
-          @click=${toggleTheme}
-          aria-label="Toggle light/dark theme"
+          class="theme-toggle cluster align-center justify-center"
+          @click=${cycleTheme}
+          aria-label=${() => `Theme: ${THEME_DISPLAY[themePref.val].label} (click to change)`}
+          title=${() => `Theme: ${THEME_DISPLAY[themePref.val].label}`}
         >
-          ${() => (theme.val === "dark" ? "☀" : "☾")}
+          ${() => THEME_DISPLAY[themePref.val].icon()}
         </button>
       </div>
     </header>
@@ -69,7 +82,6 @@ function Nav(): TemplateResult {
           <b>${() => health.val?.bucket_count ?? 0}</b> buckets ·
           <b>${() => health.val?.object_count ?? 0}</b> objects
         </div>
-        <div class="mono muted">region ${() => health.val?.region ?? "us-east-1"}</div>
       </div>
     </nav>
   `;

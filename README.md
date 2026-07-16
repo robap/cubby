@@ -256,26 +256,36 @@ from a browser, only cross-origin `fetch()` is gated.
 
 cubby serves a built-in **S3 debugger** at **`/_/`** — no extra process, no
 Node, no build step for you; it ships inside the binary. Open
-`http://127.0.0.1:9000/_/` after `serve`.
+`http://127.0.0.1:9000/_/` after `serve` — or just visit
+`http://127.0.0.1:9000/` in a browser and cubby redirects you there (a bare
+`GET /` that asks for HTML and carries no SigV4 is treated as a human's browser;
+signed S3 clients at `/` still get ListBuckets). The control follows the OS
+light/dark setting by default and has a **theme toggle** cycling dark → light →
+system (your choice is remembered across sessions).
 
 - **Live request log** (the home screen) — a live-streaming table of the S3
   requests *your app* makes: resolved operation (`PutObject`,
-  `CreateMultipartUpload`, `UploadPart`, …), bucket/key, status (colored by
-  class), duration, and byte counts. Filter as you type, pause (with an "N new"
-  badge), and click a row to expand its full fields (`op`, `auth`, `error_code`).
-  A big `s3.upload()` visibly decomposes into `CreateMultipartUpload` +
-  N×`UploadPart` + `CompleteMultipartUpload` in real time, and a `403` shows its
-  error code so you can see *why* at a glance. The same stream is on stdout (one
-  aligned line per request — suppress with **`--quiet`**) and at
-  `GET /_/api/events` as SSE or `?format=ndjson` for `jq`/tests.
+  `CreateMultipartUpload`, `UploadPart`, …), bucket/key, a human **time-ago**
+  column, status (colored by class), duration, and byte counts. Filter as you
+  type, pause (with an "N new" badge), **Clear** the log, and click a row to
+  expand its full fields (`op`, `auth`, `error_code`, timestamp) — including a
+  **View object** link that jumps straight to that object in the browser. A big
+  `s3.upload()` visibly decomposes into `CreateMultipartUpload` + N×`UploadPart`
+  + `CompleteMultipartUpload` in real time, and a `403` shows its error code so
+  you can see *why* at a glance. The same stream is on stdout (one aligned line
+  per request — suppress with **`--quiet`**) and at `GET /_/api/events` as SSE or
+  `?format=ndjson` for `jq`/tests.
 - **Bucket browser** — a file-explorer over your buckets: folder navigation
   (prefix + `/` delimiter) with breadcrumbs, drag-and-drop upload into the
   current prefix, per-row download and delete, a **"+ New bucket"** button, and a
-  substring **key search** (scoped to a bucket or across all buckets).
+  substring **key search** (scoped to a bucket or across all buckets). Every
+  location is a **deep link**: the selected bucket, an open folder prefix, and an
+  open object each have their own URL, so you can bookmark or share one and the
+  browser Back/Forward buttons move between them.
 - **Object detail** — metadata (size, content-type, ETag, last-modified,
-  `x-amz-meta-*`), inline preview for images / text / JSON, and a
-  **presigned-URL** generator (GET/PUT + expiry picker) that mints a
-  credential-less link.
+  `x-amz-meta-*`), inline preview for images / text / JSON / XML (JSON and XML
+  are pretty-printed; tall previews scroll), and a **presigned-URL** generator
+  (GET/PUT + expiry picker) that mints a credential-less link.
 
 The log mirrors **client** S3 traffic only; uploads/deletes/bucket-creates done
 *through the UI* go straight to storage and deliberately do not appear in it, so

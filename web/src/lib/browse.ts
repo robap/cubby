@@ -59,6 +59,62 @@ export function uploadKey(prefix: string, fileName: string): string {
   return `${prefix}${fileName}`;
 }
 
+/** A browser location: the selected bucket, the folder prefix, and the open
+ * object key (or `null` when browsing a folder rather than an object). */
+export type BrowseLocation = {
+  bucket: string | null;
+  prefix: string;
+  object: string | null;
+};
+
+/**
+ * The parent folder prefix of a key: everything up to and including its last
+ * `/`, or `""` for a top-level key. So an open object hydrates back into the
+ * folder that contains it.
+ * @param {string} key
+ * @returns {string}
+ */
+export function parentPrefix(key: string): string {
+  const idx = key.lastIndexOf("/");
+  return idx >= 0 ? key.slice(0, idx + 1) : "";
+}
+
+/**
+ * Encode a browser location as a `/_/browser` URL. A folder carries
+ * `?bucket=&prefix=`, an open object `?bucket=&object=` (its prefix is derived
+ * from the key on the way back). Values are percent-encoded with `encodeURIComponent`
+ * so keys with `/` and spaces round-trip as `%20`, never a `+`. No bucket yet
+ * → the bare browser URL (default landing).
+ * @param {BrowseLocation} loc
+ * @returns {string}
+ */
+export function locationToUrl(loc: BrowseLocation): string {
+  if (!loc.bucket) return "/_/browser";
+  const parts = [`bucket=${encodeURIComponent(loc.bucket)}`];
+  if (loc.object !== null) {
+    parts.push(`object=${encodeURIComponent(loc.object)}`);
+  } else if (loc.prefix) {
+    parts.push(`prefix=${encodeURIComponent(loc.prefix)}`);
+  }
+  return `/_/browser?${parts.join("&")}`;
+}
+
+/**
+ * Decode a browser location from a router query map (values already
+ * percent-decoded). An `object` query wins over `prefix` and derives its own
+ * folder prefix; a `prefix` query without an object is a folder view; no bucket
+ * is the default landing.
+ * @param {Record<string, string>} query
+ * @returns {BrowseLocation}
+ */
+export function urlToLocation(query: Record<string, string>): BrowseLocation {
+  const bucket = query.bucket ?? null;
+  if (!bucket) return { bucket: null, prefix: "", object: null };
+  const object = query.object ?? null;
+  const prefix = object !== null ? parentPrefix(object) : query.prefix ?? "";
+  return { bucket, prefix, object };
+}
+
 /** One run of a key, flagged as a search match or not. */
 export type HighlightPart = { text: string; match: boolean };
 

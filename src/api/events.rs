@@ -16,8 +16,20 @@ use hyper::{Response, StatusCode};
 use s3s::Body;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::events::Event;
+use crate::events::{BusSignal, Event};
 use crate::http::AppState;
+
+/// `POST /_/api/events/clear` — drain the server-side ring and tell live streams
+/// to empty. Returns `204 No Content`. Draining the ring (not just the client's
+/// local list) is what makes the clear survive `EventSource` reconnect replay
+/// and stay consistent across open tabs.
+pub fn clear(state: &Arc<AppState>) -> Response<Body> {
+    state.events.clear();
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .expect("clear response builds")
+}
 
 /// Stream the event log. SSE by default; newline-delimited JSON when
 /// `?format=ndjson` is set.
@@ -43,7 +55,8 @@ pub fn stream(req: &hyper::Request<Incoming>, state: &Arc<AppState>) -> Response
         }
         loop {
             match rx.recv().await {
-                Ok(ev) => yield Ok(Frame::data(frame_bytes(&ev, ndjson))),
+                Ok(BusSignal::Event(ev)) => yield Ok(Frame::data(frame_bytes(&ev, ndjson))),
+                Ok(BusSignal::Clear) => yield Ok(Frame::data(clear_bytes(ndjson))),
                 Err(RecvError::Lagged(n)) => yield Ok(Frame::data(dropped_bytes(n, ndjson))),
                 Err(RecvError::Closed) => break,
             }
@@ -73,6 +86,18 @@ fn frame_bytes(ev: &Event, ndjson: bool) -> Bytes {
         Bytes::from(format!("{json}\n"))
     } else {
         Bytes::from(format!("id: {}\ndata: {json}\n\n", ev.id))
+    }
+}
+
+/// Encode a "clear" directive telling the client to empty its live view: a
+/// default (unnamed) SSE `data:` frame, or an ndjson `{"clear":true}` line. It
+/// rides the same default `data:` channel as events — carrying `"clear":true`
+/// instead of an `id` — so the client's one `onmessage` handler sees it.
+fn clear_bytes(ndjson: bool) -> Bytes {
+    if ndjson {
+        Bytes::from_static(b"{\"clear\":true}\n")
+    } else {
+        Bytes::from_static(b"data: {\"clear\":true}\n\n")
     }
 }
 
@@ -130,6 +155,18 @@ mod tests {
         assert!(!s.contains("data:"));
         assert!(s.ends_with("}\n"));
         assert_eq!(s.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn clear_marker_shapes() {
+        assert_eq!(
+            std::str::from_utf8(&clear_bytes(true)).unwrap(),
+            "{\"clear\":true}\n"
+        );
+        assert_eq!(
+            std::str::from_utf8(&clear_bytes(false)).unwrap(),
+            "data: {\"clear\":true}\n\n"
+        );
     }
 
     #[test]

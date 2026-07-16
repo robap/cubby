@@ -1,5 +1,5 @@
 import { describe, it, expect } from "zero/test";
-import { appendCapped, elapsedLabel, matchesFilter } from "./log.ts";
+import { appendCapped, matchesFilter, timeAgo } from "./log.ts";
 import type { LogEvent } from "./api.ts";
 
 /**
@@ -83,14 +83,27 @@ describe("appendCapped", () => {
   });
 });
 
-describe("elapsedLabel", () => {
-  it("formats seconds since origin to two decimals", () => {
-    expect(elapsedLabel(24350, 0)).toBe("24.35s");
-    expect(elapsedLabel(5000, 2000)).toBe("3.00s");
-    expect(elapsedLabel(1_700_000_012_340, 1_700_000_000_000)).toBe("12.34s");
+describe("timeAgo", () => {
+  const now = 1_700_000_000_000;
+
+  it("shows `now` under a second", () => {
+    expect(timeAgo(now, now)).toBe("now");
+    expect(timeAgo(now - 999, now)).toBe("now");
   });
 
-  it("clamps a pre-origin timestamp to 0.00s", () => {
-    expect(elapsedLabel(1000, 2000)).toBe("0.00s");
+  it("shows seconds, minutes, hours, days at each threshold", () => {
+    expect(timeAgo(now - 1_000, now)).toBe("1s");
+    expect(timeAgo(now - 5_000, now)).toBe("5s");
+    expect(timeAgo(now - 59_000, now)).toBe("59s");
+    expect(timeAgo(now - 60_000, now)).toBe("1m");
+    expect(timeAgo(now - 2 * 60_000, now)).toBe("2m");
+    expect(timeAgo(now - 60 * 60_000, now)).toBe("1h");
+    expect(timeAgo(now - 3 * 60 * 60_000, now)).toBe("3h");
+    expect(timeAgo(now - 24 * 60 * 60_000, now)).toBe("1d");
+    expect(timeAgo(now - 3 * 24 * 60 * 60_000, now)).toBe("3d");
+  });
+
+  it("clamps a future timestamp to `now`", () => {
+    expect(timeAgo(now + 5_000, now)).toBe("now");
   });
 });

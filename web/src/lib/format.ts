@@ -81,6 +81,19 @@ export function middleTruncate(s: string, max = 48): string {
 }
 
 /**
+ * End-truncate an opaque value (an etag, an id) to `max` characters, appending
+ * an ellipsis when shortened. Unlike {@link middleTruncate}, only the head is
+ * kept — the tail of a hash carries no meaning. Pair with a `title` attribute
+ * holding the full value.
+ * @param {string} s
+ * @param {number} max
+ * @returns {string}
+ */
+export function truncateEnd(s: string, max = 10): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/**
  * Format an ISO-8601 timestamp as `YYYY-MM-DD HH:MM` (local), or `—`.
  * @param {string | null | undefined} iso
  * @returns {string}

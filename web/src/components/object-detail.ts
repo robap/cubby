@@ -7,9 +7,10 @@ import { effect, html, signal } from "zero";
 import type { ObjectMeta } from "../lib/api.ts";
 import type { TemplateResult } from "zero";
 import { Button, Select } from "zero/components";
+import { ChevronLeftIcon } from "./icons.ts";
 import { contentUrl } from "../lib/api.ts";
 import { fmtDate, groupDigits, humanBytes } from "../lib/format.ts";
-import { EXPIRY_OPTIONS, previewKind } from "../lib/preview.ts";
+import { EXPIRY_OPTIONS, formatPreview, previewKind } from "../lib/preview.ts";
 import {
   closeObject,
   generatePresign,
@@ -30,10 +31,10 @@ export default function ObjectDetail(): TemplateResult {
   loadPreviewText(previewText);
   const backLabel = () => `${selectedBucket.val ?? ""}/${prefix.val}`;
   return html`
-    <section class="screen detail-screen flex-col">
+    <section class="screen detail-screen stack gap-0">
       <header class="detail-topbar split align-center pad-md border-b">
         <button class="crumb-back cluster align-center gap-xs" @click=${closeObject}>
-          <span aria-hidden="true">‹</span>
+          ${ChevronLeftIcon()}
           <span class="mono">${backLabel}</span>
         </button>
         <div class="cluster align-center gap-sm preview-label">
@@ -42,7 +43,7 @@ export default function ObjectDetail(): TemplateResult {
         </div>
       </header>
       <div class="detail-body">
-        <div class="preview-pane flex-row align-center justify-center">${() => PreviewPane(objectMeta.val, previewText.val)}</div>
+        <div class="preview-pane stack gap-0">${() => PreviewPane(objectMeta.val, previewText.val)}</div>
         <aside class="meta-pane stack gap-lg pad-lg">
           ${() => (objectMeta.val ? MetaTables(objectMeta.val) : html`<div class="muted">Loading…</div>`)}
           ${PresignCard()}
@@ -66,7 +67,7 @@ function loadPreviewText(sink: { set(v: string | null): void }): void {
     sink.set(null);
     if (!meta || !bucket || !key) return;
     const kind = previewKind(meta.content_type, meta.size);
-    if (kind !== "text" && kind !== "json") return;
+    if (kind !== "text" && kind !== "json" && kind !== "xml") return;
     fetch(contentUrl(bucket, key))
       .then((r) => r.text())
       .then((t) => sink.set(t))
@@ -88,8 +89,9 @@ function PreviewPane(meta: ObjectMeta | null, textBody: string | null): Template
   if (kind === "image") {
     return html`<img class="preview-img" src=${contentUrl(bucket, key)} alt=${key} />`;
   }
-  if (kind === "text" || kind === "json") {
-    return html`<pre class="preview-text mono">${textBody ?? "Loading…"}</pre>`;
+  if (kind === "text" || kind === "json" || kind === "xml") {
+    const body = textBody === null ? "Loading…" : formatPreview(kind, textBody);
+    return html`<pre class="preview-text mono">${body}</pre>`;
   }
   return html`
     <div class="preview-download stack gap-md align-center justify-center">
