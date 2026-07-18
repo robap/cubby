@@ -135,13 +135,16 @@ impl Db {
     }
 
     /// Delete an object row. No error if the key does not exist (idempotent).
-    pub fn delete_object(&self, bucket: &str, key: &str) -> rusqlite::Result<()> {
+    /// Returns `true` if a row was actually removed, `false` if the key did not
+    /// exist — the caller uses this to fire a removal notification only for a
+    /// real delete.
+    pub fn delete_object(&self, bucket: &str, key: &str) -> rusqlite::Result<bool> {
         self.with_conn(|c| {
-            c.execute(
+            let n = c.execute(
                 "DELETE FROM objects WHERE bucket = ?1 AND key = ?2",
                 rusqlite::params![bucket, key],
             )?;
-            Ok(())
+            Ok(n == 1)
         })
     }
 
@@ -149,19 +152,27 @@ impl Db {
     /// key (a never-existed key removes zero rows), matching the batch
     /// DeleteObjects contract; the caller unlinks the files afterward. An empty
     /// list is a no-op.
-    pub fn delete_objects(&self, bucket: &str, keys: &[String]) -> rusqlite::Result<()> {
+    ///
+    /// Returns the keys that were **actually removed** (a row existed), in the
+    /// input order — the caller fires one removal notification per real delete,
+    /// not per requested key.
+    pub fn delete_objects(&self, bucket: &str, keys: &[String]) -> rusqlite::Result<Vec<String>> {
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
+            let mut removed = Vec::new();
             {
                 let mut stmt = tx.prepare("DELETE FROM objects WHERE bucket = ?1 AND key = ?2")?;
                 for key in keys {
-                    stmt.execute(rusqlite::params![bucket, key])?;
+                    if stmt.execute(rusqlite::params![bucket, key])? == 1 {
+                        removed.push(key.clone());
+                    }
                 }
             }
-            tx.commit()
+            tx.commit()?;
+            Ok(removed)
         })
     }
 
@@ -467,6 +478,87 @@ impl Db {
             tx.commit()
         })
     }
+
+    // --- Bucket notifications -----------------------------------------------
+
+    /// Insert one webhook destination for a bucket and return its assigned `id`.
+    /// The `events` list is stored as a JSON array string; validation of its
+    /// contents (known event names, `http://` url, known format, positive
+    /// timeout) happens at the seam before this is called — the DB layer stores
+    /// what it is given. Deleting the parent bucket cascades these rows away.
+    pub fn insert_bucket_notification(&self, d: &NotificationDraft) -> rusqlite::Result<i64> {
+        let events_json = serde_json::to_string(&d.events)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO bucket_notifications \
+                 (bucket, url, events, prefix, suffix, format, timeout_ms, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    d.bucket,
+                    d.url,
+                    events_json,
+                    d.prefix,
+                    d.suffix,
+                    d.format,
+                    d.timeout_ms,
+                    d.created_at,
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// All webhook destinations for `bucket`, ascending by `id` (insertion
+    /// order). Used both by the config seam (GET) and the delivery engine (which
+    /// filters the returned set per event/prefix/suffix).
+    pub fn list_bucket_notifications(
+        &self,
+        bucket: &str,
+    ) -> rusqlite::Result<Vec<NotificationRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, bucket, url, events, prefix, suffix, format, timeout_ms, created_at \
+                 FROM bucket_notifications WHERE bucket = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([bucket], notification_row_from)?;
+            rows.collect()
+        })
+    }
+
+    /// Delete one destination by `id`, scoped to its `bucket` so a caller can't
+    /// remove another bucket's row by guessing an id. Returns `true` if a row was
+    /// removed, `false` if none matched (unknown id, or wrong bucket).
+    pub fn delete_bucket_notification(&self, bucket: &str, id: i64) -> rusqlite::Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM bucket_notifications WHERE bucket = ?1 AND id = ?2",
+                rusqlite::params![bucket, id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+}
+
+/// Build a [`NotificationRow`] from a `SELECT id, bucket, url, events, prefix,
+/// suffix, format, timeout_ms, created_at` row (column order fixed). The
+/// `events` column is a JSON array string, parsed back into a `Vec<String>`.
+fn notification_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationRow> {
+    let events_json: String = r.get(3)?;
+    let events: Vec<String> = serde_json::from_str(&events_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(NotificationRow {
+        id: r.get(0)?,
+        bucket: r.get(1)?,
+        url: r.get(2)?,
+        events,
+        prefix: r.get(4)?,
+        suffix: r.get(5)?,
+        format: r.get(6)?,
+        timeout_ms: r.get(7)?,
+        created_at: r.get(8)?,
+    })
 }
 
 /// Build a [`PartRow`] from a `SELECT part_number, size, etag` row.
@@ -564,6 +656,41 @@ pub struct PartRow {
     pub etag: String,
 }
 
+/// A row of the `bucket_notifications` table: one webhook destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRow {
+    pub id: i64,
+    pub bucket: String,
+    pub url: String,
+    /// The subscribed event list (e.g. `s3:ObjectCreated:*`), stored as a JSON
+    /// array.
+    pub events: Vec<String>,
+    /// Optional key-prefix filter (absent = no constraint).
+    pub prefix: Option<String>,
+    /// Optional key-suffix filter (absent = no constraint).
+    pub suffix: Option<String>,
+    /// `s3-notification` | `eventbridge`.
+    pub format: String,
+    /// Per-destination delivery timeout in milliseconds.
+    pub timeout_ms: i64,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+/// The fields needed to insert a new [`NotificationRow`] — everything but the
+/// autoassigned `id`.
+#[derive(Debug, Clone)]
+pub struct NotificationDraft {
+    pub bucket: String,
+    pub url: String,
+    pub events: Vec<String>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub format: String,
+    pub timeout_ms: i64,
+    pub created_at: i64,
+}
+
 /// Result of [`Db::try_delete_bucket`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteBucketOutcome {
@@ -609,6 +736,21 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     etag        TEXT    NOT NULL,
     PRIMARY KEY (upload_id, part_number)
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS bucket_notifications (
+    id           INTEGER PRIMARY KEY,
+    bucket       TEXT    NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
+    url          TEXT    NOT NULL,
+    events       TEXT    NOT NULL,
+    prefix       TEXT,
+    suffix       TEXT,
+    format       TEXT    NOT NULL,
+    timeout_ms   INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS bucket_notifications_by_bucket
+    ON bucket_notifications (bucket);
 ";
 
 #[cfg(test)]
@@ -781,8 +923,35 @@ mod tests {
     fn delete_objects_empty_list_is_noop() {
         let (_tmp, db) = open_temp();
         seed(&db, "b", "keep");
-        db.delete_objects("b", &[]).unwrap();
+        assert!(db.delete_objects("b", &[]).unwrap().is_empty());
         assert!(db.get_object("b", "keep").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_object_reports_whether_a_row_was_removed() {
+        let (_tmp, db) = open_temp();
+        seed(&db, "b", "here");
+        // First delete removes the row → true.
+        assert!(db.delete_object("b", "here").unwrap());
+        // A repeat, or a never-existed key → false (nothing removed).
+        assert!(!db.delete_object("b", "here").unwrap());
+        assert!(!db.delete_object("b", "ghost").unwrap());
+    }
+
+    #[test]
+    fn delete_objects_returns_only_the_keys_actually_removed() {
+        let (_tmp, db) = open_temp();
+        for k in ["k1", "k2", "k3"] {
+            seed(&db, "b", k);
+        }
+        // A mix of real and never-existed keys: only the real removals come
+        // back, in input order (ghost is skipped, not reported).
+        let removed = db
+            .delete_objects("b", &["k1".into(), "ghost".into(), "k3".into()])
+            .unwrap();
+        assert_eq!(removed, vec!["k1".to_owned(), "k3".to_owned()]);
+        // k2 was never in the batch and survives.
+        assert!(db.get_object("b", "k2").unwrap().is_some());
     }
 
     #[test]
@@ -1003,6 +1172,96 @@ mod tests {
         // …and all multipart bookkeeping gone.
         assert!(db.get_multipart("u1").unwrap().is_none());
         assert!(db.all_parts("u1").unwrap().is_empty());
+    }
+
+    fn sample_draft(bucket: &str) -> NotificationDraft {
+        NotificationDraft {
+            bucket: bucket.to_owned(),
+            url: "http://localhost:3000/hook".to_owned(),
+            events: vec!["s3:ObjectCreated:*".to_owned()],
+            prefix: Some("photos/".to_owned()),
+            suffix: Some(".jpg".to_owned()),
+            format: "s3-notification".to_owned(),
+            timeout_ms: 5000,
+            created_at: 42,
+        }
+    }
+
+    #[test]
+    fn insert_then_list_round_trips_a_notification() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        let id = db
+            .insert_bucket_notification(&sample_draft("uploads"))
+            .unwrap();
+        assert!(id >= 1);
+
+        let rows = db.list_bucket_notifications("uploads").unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, id);
+        assert_eq!(row.bucket, "uploads");
+        assert_eq!(row.url, "http://localhost:3000/hook");
+        assert_eq!(row.events, vec!["s3:ObjectCreated:*".to_owned()]);
+        assert_eq!(row.prefix.as_deref(), Some("photos/"));
+        assert_eq!(row.suffix.as_deref(), Some(".jpg"));
+        assert_eq!(row.format, "s3-notification");
+        assert_eq!(row.timeout_ms, 5000);
+        assert_eq!(row.created_at, 42);
+    }
+
+    #[test]
+    fn list_notifications_is_scoped_and_ordered_by_id() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("a", 0).unwrap();
+        db.create_bucket("b", 0).unwrap();
+        let a1 = db.insert_bucket_notification(&sample_draft("a")).unwrap();
+        let a2 = db.insert_bucket_notification(&sample_draft("a")).unwrap();
+        db.insert_bucket_notification(&sample_draft("b")).unwrap();
+
+        let a_ids: Vec<i64> = db
+            .list_bucket_notifications("a")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(a_ids, vec![a1, a2]);
+        assert_eq!(db.list_bucket_notifications("b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_notification_removes_only_the_matching_row() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        let id = db
+            .insert_bucket_notification(&sample_draft("uploads"))
+            .unwrap();
+
+        // Wrong bucket for a real id → no-op, no removal.
+        assert!(!db.delete_bucket_notification("other", id).unwrap());
+        assert_eq!(db.list_bucket_notifications("uploads").unwrap().len(), 1);
+        // Correct bucket + id → removed.
+        assert!(db.delete_bucket_notification("uploads", id).unwrap());
+        assert!(db.list_bucket_notifications("uploads").unwrap().is_empty());
+        // A second delete of the same id removes nothing.
+        assert!(!db.delete_bucket_notification("uploads", id).unwrap());
+    }
+
+    #[test]
+    fn deleting_bucket_cascades_its_notifications() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        db.insert_bucket_notification(&sample_draft("uploads"))
+            .unwrap();
+        assert_eq!(db.list_bucket_notifications("uploads").unwrap().len(), 1);
+
+        // An empty bucket (notifications aren't objects) deletes cleanly, and
+        // the FK ON DELETE CASCADE removes its notification rows.
+        assert_eq!(
+            db.try_delete_bucket("uploads").unwrap(),
+            DeleteBucketOutcome::Deleted
+        );
+        assert!(db.list_bucket_notifications("uploads").unwrap().is_empty());
     }
 
     #[test]

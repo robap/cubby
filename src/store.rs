@@ -27,6 +27,7 @@ use crate::datadir::DataDir;
 use crate::db::{Db, DeleteBucketOutcome, MultipartRow, ObjectRow, PartRow};
 use crate::listing::{self, ListPage, ListParams};
 use crate::multipart::{self, CompleteError, RecordedPart, SubmittedPart};
+use crate::notify::{EventKind, Notifier, ObjectEvent};
 
 /// Monotonic counter for unique temp-file names within this process.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +43,10 @@ pub struct Store {
     /// The configured access key, used as the fixed dev `Owner` identity in
     /// listings (we have no real IAM; a stable owner keeps SDKs happy).
     access_key: String,
+    /// The webhook notifier, attached only to the router-built store (via
+    /// [`Store::with_notifier`]). The seed-path store leaves this `None`, so
+    /// seed writes fire nothing — exactly the spec's "seed writes don't fire".
+    notifier: Option<Notifier>,
 }
 
 impl Store {
@@ -50,6 +55,24 @@ impl Store {
             db,
             dirs,
             access_key,
+            notifier: None,
+        }
+    }
+
+    /// Attach a [`Notifier`] so successful object mutations fire webhooks. Only
+    /// the router-built store gets one; seeding and tests keep the default
+    /// (`None`) and stay silent.
+    pub fn with_notifier(mut self, notifier: Notifier) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Fire an object event on the attached notifier, if any. A no-op when no
+    /// notifier is attached (seed/test stores). Delivery is fully async — this
+    /// never blocks the mutation that called it.
+    fn fire(&self, event: ObjectEvent) {
+        if let Some(notifier) = &self.notifier {
+            notifier.notify(event);
         }
     }
 
@@ -109,10 +132,14 @@ impl Store {
     /// `metadata_json` is the user metadata already serialized to a JSON object
     /// (`{}` for none), exactly as [`put_object`](Self::put_object) stores it.
     ///
+    /// Returns `(hex content-MD5, size in bytes)` — the caller needs the size to
+    /// carry in a creation notification without re-reading the row.
+    ///
     /// The bucket is assumed to already exist: PutObject verifies it up front
     /// before accepting bytes, and the `--seed` loader creates it first. This is
     /// the single write path shared by PutObject and seeding — no second,
-    /// drifting implementation.
+    /// drifting implementation. It does **not** fire notifications itself (seed
+    /// uses it directly); the PutObject handler fires after it returns.
     pub async fn put_bytes(
         &self,
         bucket: &str,
@@ -120,7 +147,7 @@ impl Store {
         body: Option<StreamingBlob>,
         content_type: Option<String>,
         metadata_json: String,
-    ) -> S3Result<String> {
+    ) -> S3Result<(String, i64)> {
         let final_path = self
             .dirs
             .bucket_dir(bucket)
@@ -152,7 +179,7 @@ impl Store {
             metadata: metadata_json,
         };
         self.db_call(move |db| db.put_object(&row)).await?;
-        Ok(etag_hex)
+        Ok((etag_hex, size))
     }
 
     /// Create the bucket `name` if it does not already exist: make its directory
@@ -465,9 +492,18 @@ impl s3s::S3 for Store {
         // MD5 computed, content-type defaulted.
         let metadata =
             serde_json::to_string(&input.metadata.unwrap_or_default()).map_err(internal)?;
-        let etag_hex = self
+        let (etag_hex, size) = self
             .put_bytes(&bucket, &key, input.body, input.content_type, metadata)
             .await?;
+
+        // Committed → fire an ObjectCreated:Put notification (async, best-effort).
+        self.fire(ObjectEvent::created(
+            &bucket,
+            &key,
+            EventKind::Put,
+            size,
+            &etag_hex,
+        ));
 
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(etag_hex)),
@@ -549,7 +585,7 @@ impl s3s::S3 for Store {
         // matching S3's "delete always succeeds" contract.
         let b = bucket.clone();
         let k = key.clone();
-        self.db_call(move |db| db.delete_object(&b, &k)).await?;
+        let removed = self.db_call(move |db| db.delete_object(&b, &k)).await?;
 
         let path = self
             .dirs
@@ -559,6 +595,12 @@ impl s3s::S3 for Store {
             if err.kind() != std::io::ErrorKind::NotFound {
                 return Err(internal(err));
             }
+        }
+
+        // Fire only for a real removal (a never-existed key removes no row and
+        // fires nothing — ObjectRemoved carries no size/eTag).
+        if removed {
+            self.fire(ObjectEvent::removed(&bucket, &key));
         }
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -1028,6 +1070,16 @@ impl s3s::S3 for Store {
         self.db_call(move |db| db.complete_multipart(&uid, &object))
             .await?;
 
+        // Committed → one ObjectCreated:CompleteMultipartUpload (not one per
+        // part), carrying the `-N` composite ETag.
+        self.fire(ObjectEvent::created(
+            &bucket,
+            &key,
+            EventKind::CompleteMultipartUpload,
+            total_size,
+            &composite,
+        ));
+
         // Staging tree no longer referenced; remove it (best-effort — an orphan
         // dir is invisible and sweepable).
         let stage = self.dirs.multipart_dir().join(&upload_id);
@@ -1164,16 +1216,26 @@ impl s3s::S3 for Store {
         // the source's, preserved verbatim (a multipart source keeps its `-N`).
         let now = unix_now();
         let etag = src_row.etag.clone();
+        let size = src_row.size;
         let row = ObjectRow {
-            bucket: dest_bucket,
-            key: dest_key,
-            size: src_row.size,
+            bucket: dest_bucket.clone(),
+            key: dest_key.clone(),
+            size,
             etag: etag.clone(),
             content_type,
             last_modified: now,
             metadata,
         };
         self.db_call(move |db| db.put_object(&row)).await?;
+
+        // Committed → ObjectCreated:Copy for the destination key.
+        self.fire(ObjectEvent::created(
+            &dest_bucket,
+            &dest_key,
+            EventKind::Copy,
+            size,
+            &etag,
+        ));
 
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
@@ -1214,7 +1276,7 @@ impl s3s::S3 for Store {
         // unlink each file — the Phase 1 delete ordering, a NotFound ignored.
         let b = bucket.clone();
         let ks = keys.clone();
-        self.db_call(move |db| db.delete_objects(&b, &ks)).await?;
+        let removed = self.db_call(move |db| db.delete_objects(&b, &ks)).await?;
         for key in &keys {
             let path = self
                 .dirs
@@ -1225,6 +1287,12 @@ impl s3s::S3 for Store {
                     return Err(internal(err));
                 }
             }
+        }
+
+        // One ObjectRemoved:Delete per key that actually existed (a never-existed
+        // key in the batch fires nothing).
+        for key in &removed {
+            self.fire(ObjectEvent::removed(&bucket, key));
         }
 
         // Non-quiet: a `Deleted` entry per requested key (S3 reports even a

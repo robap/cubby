@@ -87,6 +87,28 @@ export type ObjectMeta = {
 
 export type PresignResult = { url: string; expires_at: string };
 
+/** One webhook notification destination (mirrors the Rust `NotificationJson`). */
+export type NotificationInfo = {
+  id: number;
+  url: string;
+  events: string[];
+  prefix: string | null;
+  suffix: string | null;
+  format: string;
+  timeout_ms: number;
+  created_at: string;
+};
+
+/** The body accepted by `POST …/notifications` (defaults applied server-side). */
+export type NotificationDraft = {
+  url: string;
+  events: string[];
+  prefix?: string;
+  suffix?: string;
+  format?: string;
+  timeout_ms?: number;
+};
+
 /** Percent-encode a key for use in an API path (keeping it readable). */
 function encKey(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
@@ -162,4 +184,30 @@ export function presign(body: {
   expires_in_s: number;
 }): Promise<PresignResult> {
   return http.post<PresignResult>("/_/api/presign", body);
+}
+
+/** `GET /_/api/buckets/{bucket}/notifications` — the bucket's destinations. */
+export function listNotifications(bucket: string): Promise<{ notifications: NotificationInfo[] }> {
+  return http.get<{ notifications: NotificationInfo[] }>(
+    `/_/api/buckets/${encodeURIComponent(bucket)}/notifications`,
+  );
+}
+
+/**
+ * `POST /_/api/buckets/{bucket}/notifications` — add a destination. Rejects
+ * (HttpError 400) when the destination is invalid; the caller surfaces it.
+ */
+export function createNotification(
+  bucket: string,
+  draft: NotificationDraft,
+): Promise<NotificationInfo> {
+  return http.post<NotificationInfo>(
+    `/_/api/buckets/${encodeURIComponent(bucket)}/notifications`,
+    draft,
+  );
+}
+
+/** `DELETE /_/api/buckets/{bucket}/notifications/{id}` — remove a destination. */
+export function deleteNotification(bucket: string, id: number): Promise<unknown> {
+  return http.delete(`/_/api/buckets/${encodeURIComponent(bucket)}/notifications/${id}`);
 }

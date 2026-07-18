@@ -136,6 +136,7 @@ mod tests {
             bytes_out: 0,
             auth: Auth::Header,
             error_code: None,
+            note: None,
         }
     }
 

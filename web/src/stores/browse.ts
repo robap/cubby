@@ -18,6 +18,7 @@ import {
 import type { BrowseLocation } from "../lib/browse.ts";
 import { locationToUrl, parentPrefix, uploadKey, urlToLocation } from "../lib/browse.ts";
 import { loadHealth } from "./chrome.ts";
+import { closePanel } from "./notifications.ts";
 
 /** All buckets, for the middle column. */
 export const buckets = signal<BucketInfo[]>([]);
@@ -89,6 +90,7 @@ export async function createBucket(name: string): Promise<void> {
  * @returns {Promise<void>}
  */
 export async function selectBucket(name: string): Promise<void> {
+  closePanel(); // a new bucket's panel opens fresh, never showing stale config
   selectedBucket.set(name);
   prefix.set("");
   searchTerm.set("");
@@ -251,6 +253,7 @@ export async function applyLocation(loc: BrowseLocation): Promise<void> {
   if (bucketChanged) {
     searchTerm.set("");
     searchResults.set(null);
+    closePanel(); // don't carry an open panel across a bucket change
   }
   selectedBucket.set(loc.bucket);
   prefix.set(loc.prefix);

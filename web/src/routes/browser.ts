@@ -13,7 +13,9 @@ import { contentUrl } from "../lib/api.ts";
 import { crumbs, folderLabel, highlightParts, viewMode } from "../lib/browse.ts";
 import { baseName, fmtDate, humanBytes, truncateEnd } from "../lib/format.ts";
 import ObjectDetail from "../components/object-detail.ts";
+import NotificationsPanel from "../components/notifications-panel.ts";
 import { ArchiveIcon, BucketIcon, DownloadIcon, FileIcon, FolderIcon, PlusIcon, TrashIcon } from "../components/icons.ts";
+import { closePanel, openPanel, panelOpen } from "../stores/notifications.ts";
 import {
   allBuckets,
   buckets,
@@ -178,7 +180,12 @@ function ListingPane(): TemplateResult {
       @dragleave=${onDragLeave}
     >
       ${SearchToolbar()}
-      ${() => (viewMode(searchTerm.val) === "search" ? SearchResults() : FolderView())}
+      ${() =>
+        panelOpen.val
+          ? NotificationsPanel()
+          : viewMode(searchTerm.val) === "search"
+            ? SearchResults()
+            : FolderView()}
       <div class="drop-overlay align-center justify-center"><span>Drop to upload to ${() => `${selectedBucket.val ?? ""}/${prefix.val}`}</span></div>
     </div>
   `;
@@ -219,14 +226,34 @@ function SearchToolbar(): TemplateResult {
           ${scopeBtn("This bucket", false)}${scopeBtn("All buckets", true)}
         </div>
       </div>
-      <span class="mono muted">
-        ${() => {
-          const res = searchResults.val;
-          return res ? `${res.results.length} matches` : "";
-        }}
-      </span>
+      <div class="cluster align-center gap-sm">
+        <span class="mono muted">
+          ${() => {
+            const res = searchResults.val;
+            return res ? `${res.results.length} matches` : "";
+          }}
+        </span>
+        <button
+          class=${() => "notifications-toggle button button-secondary button-sm" + (panelOpen.val ? " active" : "")}
+          @click=${toggleNotifications}
+        >Notifications</button>
+      </div>
     </div>
   `;
+}
+
+/**
+ * Toggle the per-bucket Notifications panel: open it (loading the bucket's
+ * destinations) when closed, close it when open. A no-op with no bucket selected.
+ * @returns {void}
+ */
+function toggleNotifications(): void {
+  if (panelOpen.val) {
+    closePanel();
+    return;
+  }
+  const bucket = selectedBucket.val;
+  if (bucket) void openPanel(bucket);
 }
 
 /**

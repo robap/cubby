@@ -51,6 +51,12 @@ pub struct Event {
     pub bytes_out: u64,
     pub auth: Auth,
     pub error_code: Option<String>,
+    /// A free-text annotation carried by synthetic events (e.g. a webhook
+    /// delivery line naming its destination and status). Real S3 events leave
+    /// this `None`. Skipped in the JSON when absent so the wire shape of an S3
+    /// event is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// What travels on the broadcast channel to live subscribers: either a newly
@@ -75,6 +81,8 @@ pub struct EventDraft {
     pub bytes_out: u64,
     pub auth: Auth,
     pub error_code: Option<String>,
+    /// See [`Event::note`]. Defaults to `None` for real S3 events.
+    pub note: Option<String>,
 }
 
 /// Default ring-buffer capacity (events retained for replay).
@@ -133,6 +141,7 @@ impl EventBus {
             bytes_out: draft.bytes_out,
             auth: draft.auth,
             error_code: draft.error_code,
+            note: draft.note,
         };
         let mut ring = self.inner.ring.lock().expect("event ring poisoned");
         if ring.len() == self.inner.capacity {
@@ -196,14 +205,19 @@ pub fn pretty(e: &Event) -> String {
         (Some(b), None) => b.clone(),
         _ => "-".to_owned(),
     };
-    format!(
+    let line = format!(
         "{:<6} {:<40} {:>3} {:>7} {:>9}",
         e.method,
         target,
         e.status,
         format!("{}ms", e.duration_ms),
         human_bytes(e.bytes_in.max(e.bytes_out)),
-    )
+    );
+    // A synthetic event (e.g. a webhook delivery) appends its note.
+    match &e.note {
+        Some(note) => format!("{line}  {note}"),
+        None => line,
+    }
 }
 
 /// Human-readable byte size for the stdout line (e.g. `2.4MB`, `512B`).
@@ -237,6 +251,7 @@ mod tests {
             bytes_out: 0,
             auth: Auth::Header,
             error_code: None,
+            note: None,
         }
     }
 
@@ -321,6 +336,7 @@ mod tests {
             bytes_out: 0,
             auth: Auth::Header,
             error_code: None,
+            note: None,
         };
         let line = pretty(&e);
         assert!(line.starts_with("PUT   "), "line: {line:?}");
@@ -328,6 +344,30 @@ mod tests {
         assert!(line.contains("200"));
         assert!(line.contains("12ms"));
         assert!(line.contains("2.4MB"), "line: {line:?}");
+    }
+
+    #[test]
+    fn pretty_appends_a_note_when_present() {
+        let e = Event {
+            id: 1,
+            ts: 0,
+            method: "POST".to_owned(),
+            op: Some("Webhook".to_owned()),
+            bucket: Some("uploads".to_owned()),
+            key: Some("photos/cat.jpg".to_owned()),
+            status: 200,
+            duration_ms: 8,
+            bytes_in: 0,
+            bytes_out: 0,
+            auth: Auth::Anonymous,
+            error_code: None,
+            note: Some("→ webhook http://localhost:3000/hook 200".to_owned()),
+        };
+        let line = pretty(&e);
+        assert!(
+            line.contains("→ webhook http://localhost:3000/hook 200"),
+            "line: {line:?}"
+        );
     }
 
     #[test]

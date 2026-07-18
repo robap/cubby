@@ -554,6 +554,27 @@
   min-height: 0;
 }
 
+// The Notifications panel fills the listing pane like the folder view, with a
+// fixed head and a scrolling body — so a long destination list scrolls inside
+// the pane instead of overflowing it.
+.notifications-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+.notifications-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+// Set the "All events" toggle apart from the individual event boxes.
+.event-check-all {
+  font-weight: var(--weight-semi);
+  padding-right: var(--space-sm);
+  border-right: var(--border-thin) solid var(--color-border);
+}
+
 .breadcrumb {
   border-bottom: var(--border-thin) solid var(--color-border);
 }

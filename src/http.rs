@@ -37,6 +37,7 @@ use crate::datadir::DataDir;
 use crate::db::Db;
 use crate::embed;
 use crate::events::{Auth, EventBus, EventDraft};
+use crate::notify::Notifier;
 use crate::store::Store;
 
 /// Everything needed to build and run the server.
@@ -75,6 +76,9 @@ pub struct AppState {
     pub events: EventBus,
     /// Whether the pretty stdout line is suppressed.
     pub quiet: bool,
+    /// The webhook notifier, so UI-originated uploads/deletes fire notifications
+    /// too (decision #2 — firing at the store layer regardless of origin).
+    pub notifier: Notifier,
 }
 
 /// The top routing layer wrapping the `s3s` service.
@@ -211,6 +215,7 @@ async fn log_and_serve_s3(
                     bytes_out: 0,
                     auth: Auth::Anonymous,
                     error_code: None,
+                    note: None,
                 },
             );
             return Err(err);
@@ -265,6 +270,7 @@ async fn log_and_serve_s3(
             bytes_out,
             auth,
             error_code,
+            note: None,
         },
     );
 
@@ -379,7 +385,11 @@ async fn serve_ui(req: hyper::Request<Incoming>, state: Arc<AppState>) -> HttpRe
 /// Build the routed service (S3 backend + fixed-credential SigV4 auth + the
 /// request-log access hook).
 pub fn build_router(cfg: &ServeConfig) -> Router {
-    let store = Store::new(cfg.db.clone(), cfg.datadir.clone(), cfg.access_key.clone());
+    // One notifier, shared by the S3 store path and the UI object path, so a
+    // mutation fires a webhook regardless of origin (decision #2).
+    let notifier = Notifier::new(cfg.db.clone(), cfg.events.clone(), cfg.quiet);
+    let store = Store::new(cfg.db.clone(), cfg.datadir.clone(), cfg.access_key.clone())
+        .with_notifier(notifier.clone());
     let mut builder = S3ServiceBuilder::new(store);
     builder.set_auth(SimpleAuth::from_single(
         cfg.access_key.clone(),
@@ -400,6 +410,7 @@ pub fn build_router(cfg: &ServeConfig) -> Router {
         started_at: Instant::now(),
         events: cfg.events.clone(),
         quiet: cfg.quiet,
+        notifier,
     });
     Router {
         s3: builder.build(),

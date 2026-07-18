@@ -419,3 +419,188 @@ async fn post_bucket_conflicts_on_duplicate() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "BucketAlreadyExists");
 }
+
+// --- Notification config seam (Step 5) --------------------------------------
+
+// POST a valid destination → 201 + id; GET lists it; DELETE removes it.
+#[tokio::test]
+async fn notification_config_crud_round_trips_through_the_seam() {
+    let server = TestServer::spawn().await;
+    server
+        .client()
+        .create_bucket()
+        .bucket("uploads")
+        .send()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let base_url = format!("{}/_/api/buckets/uploads/notifications", base(&server));
+
+    // Empty to start.
+    let listed: serde_json::Value = http
+        .get(&base_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["notifications"].as_array().unwrap().len(), 0);
+
+    // POST a valid destination → 201 with an id and the echoed fields.
+    let created = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "url": "http://localhost:3000/hook",
+            "events": ["s3:ObjectCreated:*"],
+            "prefix": "photos/",
+            "suffix": ".jpg",
+            "format": "s3-notification",
+            "timeout_ms": 4000
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let id = created["id"].as_i64().expect("id present");
+    assert!(id >= 1);
+    assert_eq!(created["url"], "http://localhost:3000/hook");
+    assert_eq!(created["prefix"], "photos/");
+    assert_eq!(created["timeout_ms"], 4000);
+
+    // GET now lists exactly that destination.
+    let listed: serde_json::Value = http
+        .get(&base_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = listed["notifications"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], id);
+    assert_eq!(arr[0]["events"][0], "s3:ObjectCreated:*");
+
+    // DELETE removes it → 204, and the list is empty again.
+    let del = http
+        .delete(format!("{base_url}/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+    let listed: serde_json::Value = http
+        .get(&base_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["notifications"].as_array().unwrap().len(), 0);
+
+    // A second delete of the same id is a 404.
+    let del2 = http
+        .delete(format!("{base_url}/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del2.status(), 404);
+}
+
+// Default format is s3-notification; timeout defaults to 5000; empty
+// prefix/suffix become null (no constraint).
+#[tokio::test]
+async fn notification_create_applies_defaults() {
+    let server = TestServer::spawn().await;
+    server
+        .client()
+        .create_bucket()
+        .bucket("uploads")
+        .send()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let base_url = format!("{}/_/api/buckets/uploads/notifications", base(&server));
+
+    let created: serde_json::Value = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "url": "http://localhost:3000/hook",
+            "events": ["s3:ObjectCreated:Put"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["format"], "s3-notification");
+    assert_eq!(created["timeout_ms"], 5000);
+    assert!(created["prefix"].is_null());
+    assert!(created["suffix"].is_null());
+}
+
+// Invalid destinations are rejected at write time (400) and persist nothing.
+#[tokio::test]
+async fn notification_create_rejects_invalid_destinations() {
+    let server = TestServer::spawn().await;
+    server
+        .client()
+        .create_bucket()
+        .bucket("uploads")
+        .send()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let base_url = format!("{}/_/api/buckets/uploads/notifications", base(&server));
+
+    let bad_bodies = [
+        // https:// url (out of scope for v0.2).
+        serde_json::json!({"url":"https://x/hook","events":["s3:ObjectCreated:*"]}),
+        // Unknown event token.
+        serde_json::json!({"url":"http://x/hook","events":["s3:ObjectMutated:*"]}),
+        // Invalid format.
+        serde_json::json!({"url":"http://x/hook","events":["s3:ObjectCreated:*"],"format":"protobuf"}),
+        // Non-positive timeout.
+        serde_json::json!({"url":"http://x/hook","events":["s3:ObjectCreated:*"],"timeout_ms":0}),
+    ];
+    for body in bad_bodies {
+        let resp = http.post(&base_url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "should reject {body}");
+    }
+
+    // Nothing was persisted.
+    let listed: serde_json::Value = http
+        .get(&base_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["notifications"].as_array().unwrap().len(), 0);
+}
+
+// POST to a nonexistent bucket is a 404 (config is bucket state).
+#[tokio::test]
+async fn notification_create_on_missing_bucket_is_404() {
+    let server = TestServer::spawn().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!(
+            "{}/_/api/buckets/ghost/notifications",
+            base(&server)
+        ))
+        .json(&serde_json::json!({
+            "url": "http://localhost:3000/hook",
+            "events": ["s3:ObjectCreated:*"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "NoSuchBucket");
+}

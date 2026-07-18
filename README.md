@@ -278,10 +278,12 @@ system (your choice is remembered across sessions).
 - **Bucket browser** — a file-explorer over your buckets: folder navigation
   (prefix + `/` delimiter) with breadcrumbs, drag-and-drop upload into the
   current prefix, per-row download and delete, a **"+ New bucket"** button, and a
-  substring **key search** (scoped to a bucket or across all buckets). Every
-  location is a **deep link**: the selected bucket, an open folder prefix, and an
-  open object each have their own URL, so you can bookmark or share one and the
-  browser Back/Forward buttons move between them.
+  substring **key search** (scoped to a bucket or across all buckets), and a
+  per-bucket **Notifications** panel to add/remove webhook destinations (see
+  [Event notifications](#event-notifications-webhook-v02)). Every location is a
+  **deep link**: the selected bucket, an open folder prefix, and an open object
+  each have their own URL, so you can bookmark or share one and the browser
+  Back/Forward buttons move between them.
 - **Object detail** — metadata (size, content-type, ETag, last-modified,
   `x-amz-meta-*`), inline preview for images / text / JSON / XML (JSON and XML
   are pretty-printed; tall previews scroll), and a **presigned-URL** generator
@@ -306,6 +308,149 @@ embedded by `src/embed.rs`), so `zero` is never on the build path. You only need
 [`zero`](https://github.com/robap/zero) to *modify* the UI: edit `web/src`, run
 `zero build` (`cargo install zero --locked` first), and commit the regenerated
 `web/dist/`. There is no CI gate on UI freshness — regenerate before committing.
+
+## Event notifications (webhook, v0.2)
+
+Event-driven S3 is one of the most common shapes a real app takes: an object
+lands → a thumbnail is generated, an import job kicks off, a row is cleaned up.
+cubby lets you **develop and debug that flow locally** — it POSTs a JSON event to
+a URL your app exposes when an object is created or removed, shaped byte-for-byte
+like the event AWS delivers, so the handler you write against cubby runs
+unchanged in prod. (This is the thing LocalStack paywalls and MinIO dropped.)
+
+It is **opt-in**: with no destinations configured, nothing fires and nothing
+changes.
+
+### Configure per bucket — live, no restart
+
+Notification config is **mutable bucket state** in `meta.sqlite` (not a startup
+file), managed from the **bucket browser's Notifications panel** or the matching
+JSON seam. Changes take effect immediately.
+
+```
+GET    /_/api/buckets/{bucket}/notifications          # list destinations
+POST   /_/api/buckets/{bucket}/notifications          # add one → 201 + id
+DELETE /_/api/buckets/{bucket}/notifications/{id}      # remove one → 204
+```
+
+A destination (the POST body, and one row of the GET):
+
+```json
+{
+  "url": "http://localhost:3000/s3-hook",
+  "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+  "prefix": "photos/",
+  "suffix": ".jpg",
+  "format": "s3-notification",
+  "timeout_ms": 5000
+}
+```
+
+- **`url`** — an **`http://`** endpoint cubby POSTs to. `https://` is rejected at
+  write time (out of scope for v0.2 — see caveats).
+- **`events`** — any of `s3:ObjectCreated:Put`, `:Copy`,
+  `:CompleteMultipartUpload`, `s3:ObjectRemoved:Delete`, or a wildcard family
+  `s3:ObjectCreated:*` / `s3:ObjectRemoved:*`.
+- **`prefix`** / **`suffix`** — optional key filters (absent = no constraint),
+  exactly like S3's `FilterRule`.
+- **`format`** — `s3-notification` (default) or `eventbridge` (see below).
+- **`timeout_ms`** — per-destination delivery timeout (default **5000**); raise
+  it for a slow, cold-starting target (e.g. SAM Local in Docker).
+
+**Validation happens at write time** — a bad destination (unknown event, invalid
+`format`, non-`http://` url, non-positive `timeout_ms`) returns `400` and
+persists nothing. Config is durable SQLite state: it survives restart, travels
+with the data directory, and is removed when you delete the bucket (`aws s3 rb`
+cascades its destinations away). Because the data dir is `.gitignore`'d, UI-set
+config does **not** travel with the repo — a clean checkout / CI dir starts with
+no destinations.
+
+### Two payload formats
+
+AWS does not emit one universal shape, so the `format` is per-destination:
+
+- **`s3-notification`** — the `{"Records":[{"s3":{…}}]}` envelope that
+  SQS/SNS/Lambda-direct integrations receive. `eventName` drops the `s3:` prefix
+  (`ObjectCreated:Put`), the object `key` is URL-encoded (spaces as `+`),
+  creations carry `size`/`eTag`, and removals omit both.
+- **`eventbridge`** — the `{"source":"aws.s3","detail-type":"Object Created",
+  "detail":{…}}` envelope the S3 → EventBridge path delivers. Note the field is
+  lowercase `etag` here (vs. `eTag` in the other shape) — an AWS inconsistency
+  cubby reproduces so handlers port cleanly — and `detail.reason` names the
+  specific API (`PutObject`, `CopyObject`, …).
+
+A handler that decodes either shape against cubby runs unchanged against the real
+service.
+
+### Filtering, per-path routing, and fan-out
+
+- **Per-bucket is the native unit** (as in AWS); **per-path** is expressed with
+  `prefix`/`suffix` filters. "Send `photos/` events to URL A and `invoices/` to
+  URL B" is two filtered destinations on the one bucket.
+- **Overlapping filters fan out** — if two destinations both match an object,
+  **both** receive the POST. This is a deliberate divergence from AWS (which
+  rejects overlapping rules): firing one object event at two local receivers is a
+  legitimate thing to test.
+
+### Delivery semantics
+
+- **Never blocks the write.** Firing happens on a background task *after* the
+  object is committed; the client's PUT/DELETE returns immediately. A slow,
+  unreachable, or `500`-returning receiver cannot stall or fail an upload.
+- **Best-effort, exactly one attempt — no retry.** A single POST bounded by
+  `timeout_ms`; a connect failure, timeout, or non-2xx is **logged and dropped**.
+  This is a dev tool, not a delivery bus (no durable outbox).
+- **Visible in the live log.** Each delivery emits a synthetic line naming the
+  destination and outcome (`→ webhook http://localhost:3000/s3-hook 200`), on
+  stdout and at `GET /_/api/events`.
+- **Fires at the store layer, regardless of origin.** A mutation made *through
+  the Web UI* fires notifications too — an intentional divergence from the live
+  log, which excludes UI mutations. **Seed writes do not fire** (they're startup
+  fixtures, before the port binds).
+
+### Try it — the bundled receiver
+
+`examples/webhook_sink.rs` is a runnable receiver that prints each POST and
+confirms it parses as an S3 event:
+
+```console
+$ cargo run --example webhook_sink -- --port 3000
+# then add a destination with url http://127.0.0.1:3000/s3-hook and upload an object:
+── POST /s3-hook
+{ "Records": [ { "eventName": "ObjectCreated:Put", "s3": { … } } ] }
+parsed as S3 event ✓  object key: photos/cat.jpg
+```
+
+Two flags exercise the delivery semantics: `--delay <ms>` (sleep before replying,
+to trip a destination's `timeout_ms` while the upload still returns promptly) and
+`--status <code>` (reply non-2xx, to see log-and-drop with no retry).
+
+**Integration recipes** — cubby always does the same thing (POST the event to a
+`url`); what runs at that url stands in for your prod routing target:
+
+- **A plain HTTP endpoint in your app** (the common case) — a route that
+  deserializes the body and runs your logic. Any language/framework.
+- **A Lambda via an in-app bridge** — add a dev-only endpoint that deserializes
+  cubby's body into your SDK's S3-event type and calls the *same* handler method
+  the Lambda uses. Runs the real handler in-process and debuggable, no Lambda
+  tooling.
+- **A Lambda via AWS SAM Local** — point the `url` at
+  `http://127.0.0.1:3001/2015-03-31/functions/<Fn>/invocations`; cubby's POST
+  body *is* the invoke payload. Higher fidelity; **raise `timeout_ms`** (e.g.
+  `20000`) so a container cold start isn't logged as a spurious timeout.
+
+### Caveats (dev-tool honesty)
+
+- **`http://` only** for v0.2 — no TLS stack is linked, so the static-musl /
+  distroless build is untouched. `https://` is a later fast-follow.
+- **`sequencer` is a local monotonic hex counter**, not AWS's value (documented
+  as such; it's present and correctly typed).
+- **Placeholder fields.** Values cubby has no real principal for
+  (`userIdentity`, `requestParameters`, `responseElements`, `ownerIdentity`, the
+  account id `000000000000`) are stable dev placeholders — don't expect a real
+  identity.
+- **No signed/authenticated webhooks** (HMAC header, SNS signatures) in v0.2 —
+  plain POST to a local dev endpoint.
 
 ## Seeding fixtures (`--seed`, Phase 6)
 

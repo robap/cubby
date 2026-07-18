@@ -136,3 +136,124 @@ impl TestServer {
         tx.commit().unwrap();
     }
 }
+
+// --- Recording webhook receiver ---------------------------------------------
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// One request captured by a [`RecordingReceiver`].
+#[derive(Clone)]
+pub struct ReceivedRequest {
+    pub path: String,
+    pub body: Vec<u8>,
+}
+
+impl ReceivedRequest {
+    /// Parse the body as JSON (panics if it isn't).
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).expect("received body is JSON")
+    }
+}
+
+/// A tiny in-test HTTP endpoint that records every POST cubby delivers to it —
+/// the "local HTTP receiver" the acceptance criteria name. Optionally sleeps
+/// before replying (to trip a destination's `timeout_ms`) and/or replies a
+/// non-2xx status (to exercise log-and-drop).
+#[derive(Clone)]
+pub struct RecordingReceiver {
+    pub addr: SocketAddr,
+    received: Arc<Mutex<Vec<ReceivedRequest>>>,
+}
+
+impl RecordingReceiver {
+    /// A receiver that replies `200` immediately.
+    pub async fn spawn() -> Self {
+        Self::spawn_with(0, 200).await
+    }
+
+    /// A receiver that sleeps `delay_ms` before replying `status`.
+    pub async fn spawn_with(delay_ms: u64, status: u16) -> Self {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Incoming;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: Arc<Mutex<Vec<ReceivedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = received.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let io = TokioIo::new(stream);
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let store = store.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let body = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes().to_vec())
+                                .unwrap_or_default();
+                            store.lock().unwrap().push(ReceivedRequest { path, body });
+                            if delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(code)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        Self { addr, received }
+    }
+
+    /// The URL a destination should POST to (`http://addr/hook`).
+    pub fn url(&self) -> String {
+        format!("http://{}/hook", self.addr)
+    }
+
+    /// How many requests have been received so far.
+    pub fn count(&self) -> usize {
+        self.received.lock().unwrap().len()
+    }
+
+    /// A snapshot of every received request.
+    pub fn requests(&self) -> Vec<ReceivedRequest> {
+        self.received.lock().unwrap().clone()
+    }
+
+    /// Wait until at least `n` requests have arrived (or `timeout` elapses),
+    /// returning whether the count was reached. Polls so a delivery that never
+    /// comes is bounded.
+    pub async fn wait_for(&self, n: usize, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.count() >= n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.count() >= n
+    }
+}

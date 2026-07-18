@@ -8,6 +8,7 @@
 mod buckets;
 mod events;
 mod health;
+mod notifications;
 mod objects;
 mod presign;
 mod search;
@@ -46,15 +47,41 @@ pub async fn dispatch(req: hyper::Request<Incoming>, state: &Arc<AppState>) -> R
         (&Method::POST, "buckets") => buckets::create(req, state).await,
         (&Method::GET, "search") => search::search(&req, state),
         (&Method::POST, "presign") => presign::presign(req, state).await,
-        _ => match parse_objects_path(&sub) {
-            Some((bucket, key)) => objects::route(method, req, state, bucket, key).await,
-            None => error(
-                StatusCode::NOT_FOUND,
-                "NotFound",
-                format!("no such API endpoint: {method} /_/api/{sub}"),
-            ),
-        },
+        // Both `buckets/{bucket}/notifications…` and `buckets/{bucket}/objects…`
+        // start `buckets/`, so match the notifications seam before the objects
+        // fallback.
+        _ => {
+            if let Some((bucket, id)) = parse_notifications_path(&sub) {
+                return notifications::route(method, req, state, bucket, id).await;
+            }
+            match parse_objects_path(&sub) {
+                Some((bucket, key)) => objects::route(method, req, state, bucket, key).await,
+                None => error(
+                    StatusCode::NOT_FOUND,
+                    "NotFound",
+                    format!("no such API endpoint: {method} /_/api/{sub}"),
+                ),
+            }
+        }
     }
+}
+
+/// Parse a `buckets/{bucket}/notifications[/{id}]` path tail into its bucket and
+/// (raw, still-string) id. The bucket has no `/`, so the `/notifications`
+/// literal is the separator. Returns `None` for non-notification paths.
+fn parse_notifications_path(sub: &str) -> Option<(String, Option<String>)> {
+    let rest = sub.strip_prefix("buckets/")?;
+    let (bucket, tail) = match rest.split_once("/notifications") {
+        Some((b, tail)) if !b.is_empty() => (b, tail),
+        _ => return None,
+    };
+    // `tail` is "" (the collection) or "/{id}" (one destination).
+    let id = tail.strip_prefix('/').filter(|s| !s.is_empty());
+    // A deeper path (`/notifications/1/x`) is not a notifications endpoint.
+    if id.is_some_and(|s| s.contains('/')) {
+        return None;
+    }
+    Some((bucket.to_owned(), id.map(str::to_owned)))
 }
 
 /// Parse a `buckets/{bucket}/objects[/{key}]` path tail into its bucket and
@@ -149,4 +176,31 @@ pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) 
         .header(CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Body::from(body))
         .expect("error response builds")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_notifications_path_splits_collection_and_item() {
+        // Collection (no id).
+        assert_eq!(
+            parse_notifications_path("buckets/uploads/notifications"),
+            Some(("uploads".to_owned(), None))
+        );
+        // One destination by id.
+        assert_eq!(
+            parse_notifications_path("buckets/uploads/notifications/7"),
+            Some(("uploads".to_owned(), Some("7".to_owned())))
+        );
+        // Not a notifications path.
+        assert_eq!(parse_notifications_path("buckets/uploads/objects/k"), None);
+        assert_eq!(parse_notifications_path("buckets"), None);
+        // A deeper path is not a notifications endpoint.
+        assert_eq!(
+            parse_notifications_path("buckets/uploads/notifications/7/extra"),
+            None
+        );
+    }
 }

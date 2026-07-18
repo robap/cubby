@@ -17,6 +17,7 @@ pub mod http;
 pub mod keypath;
 pub mod listing;
 pub mod multipart;
+pub mod notify;
 pub mod presign;
 pub mod seed;
 pub mod store;

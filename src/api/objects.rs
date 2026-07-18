@@ -23,6 +23,7 @@ use crate::db::ObjectRow;
 use crate::http::AppState;
 use crate::keypath::key_to_relpath;
 use crate::listing::{self, ListParams};
+use crate::notify::{EventKind, ObjectEvent};
 use crate::store::unix_now;
 
 /// S3's default content type when none is supplied.
@@ -434,6 +435,17 @@ async fn upload(
         );
     }
 
+    // A UI upload is a real mutation, so it fires notifications too (decision #2)
+    // — even though the UI path itself is not logged (this divergence from the
+    // live log is intentional).
+    state.notifier.notify(ObjectEvent::created(
+        bucket,
+        key,
+        EventKind::Put,
+        size,
+        &etag,
+    ));
+
     super::json(
         StatusCode::OK,
         &UploadResponse {
@@ -493,13 +505,16 @@ async fn stream_to_temp(
 /// `DELETE …/objects/{key}` — row first (source of truth), then unlink the
 /// bytes. Idempotent (`204` whether or not the key existed).
 async fn delete(state: &Arc<AppState>, bucket: &str, key: &str) -> Response<Body> {
-    if let Err(e) = state.db.delete_object(bucket, key) {
-        return super::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            e.to_string(),
-        );
-    }
+    let removed = match state.db.delete_object(bucket, key) {
+        Ok(removed) => removed,
+        Err(e) => {
+            return super::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                e.to_string(),
+            )
+        }
+    };
     let path: std::path::PathBuf = state.datadir.bucket_dir(bucket).join(key_to_relpath(key));
     if let Err(e) = tokio::fs::remove_file(&path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -509,6 +524,12 @@ async fn delete(state: &Arc<AppState>, bucket: &str, key: &str) -> Response<Body
                 e.to_string(),
             );
         }
+    }
+
+    // Fire a removal notification only when a row was actually removed (same as
+    // the S3 path); the UI mutation itself stays unlogged.
+    if removed {
+        state.notifier.notify(ObjectEvent::removed(bucket, key));
     }
     Response::builder()
         .status(StatusCode::NO_CONTENT)
