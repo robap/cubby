@@ -103,6 +103,17 @@ impl hyper::service::Service<hyper::Request<Incoming>> for Router {
             let state = self.state.clone();
             return Box::pin(async move { Ok(serve_ui(req, state).await) });
         }
+        // A CORS preflight (an unsigned `OPTIONS` carrying `Origin` +
+        // `Access-Control-Request-Method`) is answered here, **before** the `s3s`
+        // SigV4 layer — a preflight carries no signature, so it must never 403 for
+        // lack of auth. A plain `OPTIONS` (no preflight headers) returns `None` and
+        // falls through unchanged. Guarded on the method first so no normal request
+        // pays for the check.
+        if req.method() == hyper::Method::OPTIONS {
+            if let Some(resp) = maybe_preflight(&req, &self.state) {
+                return Box::pin(async move { Ok(resp) });
+            }
+        }
         // Browser probes like `/.well-known/appspecific/com.chrome.devtools.json`
         // and `/favicon.ico` are never S3 traffic; short-circuit them with a `404`
         // before the log/S3 path so they never emit an event or a pretty stdout
@@ -179,6 +190,14 @@ async fn log_and_serve_s3(
 ) -> Result<HttpResponse, HttpError> {
     let method = req.method().as_str().to_owned();
     let (bucket, key) = parse_bucket_key(req.uri().path());
+    // Capture the request `Origin` before the body is consumed. Absent for all
+    // normal SDK traffic — the sole guard that keeps the CORS lookup off the hot
+    // path when the feature is dormant.
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let bytes_in = Arc::new(AtomicU64::new(0));
     let slot: SharedSlot = Arc::new(Mutex::new(CaptureSlot::default()));
@@ -257,6 +276,18 @@ async fn log_and_serve_s3(
         (response, None)
     };
 
+    // Cross-origin response injection: when the request bore an `Origin` a bucket
+    // rule matches, add `Access-Control-Allow-Origin` (+ `Vary`) and
+    // `Access-Control-Expose-Headers` — success and error alike, so a browser can
+    // read both. Purely additive; the S3 status/body/signature are untouched.
+    let response = apply_actual_cors(
+        response,
+        &state,
+        bucket.as_deref(),
+        origin.as_deref(),
+        &method,
+    );
+
     emit_event(
         &state,
         EventDraft {
@@ -275,6 +306,49 @@ async fn log_and_serve_s3(
     );
 
     Ok(response)
+}
+
+/// Add CORS response headers to a real S3 response when the request carried an
+/// `Origin` matched by one of the bucket's rules. A no-op (returns the response
+/// unchanged) when there is no origin, no bucket, no config, or no matching rule
+/// — so normal traffic and unconfigured buckets pay only the guarded lookup.
+fn apply_actual_cors(
+    mut response: HttpResponse,
+    state: &AppState,
+    bucket: Option<&str>,
+    origin: Option<&str>,
+    method: &str,
+) -> HttpResponse {
+    let (Some(bucket), Some(origin)) = (bucket, origin) else {
+        return response;
+    };
+    let rules = state
+        .db
+        .get_bucket_cors(bucket)
+        .ok()
+        .flatten()
+        .and_then(|json| crate::cors::parse_rules(&json).ok())
+        .unwrap_or_default();
+    let Some(grant) = crate::cors::match_actual(&rules, origin, method) else {
+        return response;
+    };
+
+    let headers = response.headers_mut();
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&grant.allow_origin) {
+        headers.insert("access-control-allow-origin", v);
+    }
+    if !grant.expose_headers.is_empty() {
+        if let Ok(v) = hyper::header::HeaderValue::from_str(&grant.expose_headers.join(", ")) {
+            headers.insert("access-control-expose-headers", v);
+        }
+    }
+    if grant.vary_origin {
+        headers.append(
+            hyper::header::VARY,
+            hyper::header::HeaderValue::from_static("Origin"),
+        );
+    }
+    response
 }
 
 /// Extract the S3 error code from an error response body: the text of the first
@@ -359,6 +433,124 @@ fn redirect_to_ui() -> HttpResponse {
         .header(hyper::header::LOCATION, "/_/")
         .body(s3s::Body::empty())
         .expect("redirect response builds")
+}
+
+/// If `req` is a CORS preflight — an `OPTIONS` carrying both `Origin` and
+/// `Access-Control-Request-Method`, targeting a bucket path — answer it from the
+/// bucket's stored rules and emit a synthetic `Preflight` live-log event. A
+/// matching rule yields `204` with the `Access-Control-Allow-*` headers; no match
+/// (or a bucket with no config) yields `403` with a CORS error body and **no**
+/// allow-origin, so the browser blocks the pending request. Returns `None` for a
+/// non-preflight `OPTIONS` (missing either header, or no resolvable bucket), which
+/// falls through to `s3s` unchanged.
+fn maybe_preflight(req: &hyper::Request<Incoming>, state: &AppState) -> Option<HttpResponse> {
+    let headers = req.headers();
+    let origin = headers
+        .get(hyper::header::ORIGIN)?
+        .to_str()
+        .ok()?
+        .to_owned();
+    let method = headers
+        .get("access-control-request-method")?
+        .to_str()
+        .ok()?
+        .to_owned();
+    // CORS is bucket-scoped; a service-level OPTIONS (no bucket in the path) is
+    // not a bucket preflight and falls through.
+    let (bucket, key) = parse_bucket_key(req.uri().path());
+    let bucket = bucket?;
+
+    let requested_headers = parse_request_headers(headers.get("access-control-request-headers"));
+
+    // Load and match the bucket's rules. A direct, synchronous `state.db` read —
+    // the same way the `/_/api/` seam calls the DB (see the plan's Risks).
+    let rules = state
+        .db
+        .get_bucket_cors(&bucket)
+        .ok()
+        .flatten()
+        .and_then(|json| crate::cors::parse_rules(&json).ok())
+        .unwrap_or_default();
+    let grant = crate::cors::match_preflight(&rules, &origin, &method, &requested_headers);
+
+    let (response, status, verdict) = match &grant {
+        Some(g) => (preflight_grant_response(g), 204u16, "allowed"),
+        None => (preflight_refused_response(), 403u16, "rejected"),
+    };
+
+    // Synthetic Preflight event so "why did my browser upload fail" is visible in
+    // the same stream as S3 traffic.
+    emit_event(
+        state,
+        EventDraft {
+            method: "OPTIONS".to_owned(),
+            op: Some("Preflight".to_owned()),
+            bucket: Some(bucket),
+            key,
+            status,
+            duration_ms: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            auth: Auth::Anonymous,
+            error_code: None,
+            note: Some(format!("preflight {verdict} · origin {origin} · {method}")),
+        },
+    );
+    Some(response)
+}
+
+/// Split an `Access-Control-Request-Headers` value into a normalized (lowercased,
+/// trimmed, non-empty) list of header names. Absent header → empty list.
+fn parse_request_headers(value: Option<&hyper::header::HeaderValue>) -> Vec<String> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `204` preflight response carrying the grant's `Access-Control-Allow-*`
+/// headers (and `Vary: Origin` for an echoed origin).
+fn preflight_grant_response(g: &crate::cors::PreflightGrant) -> HttpResponse {
+    let mut builder = hyper::Response::builder()
+        .status(hyper::StatusCode::NO_CONTENT)
+        .header("Access-Control-Allow-Origin", &g.allow_origin)
+        .header("Access-Control-Allow-Methods", g.allow_methods.join(", "));
+    if !g.allow_headers.is_empty() {
+        builder = builder.header("Access-Control-Allow-Headers", g.allow_headers.join(", "));
+    }
+    if let Some(max_age) = g.max_age_seconds {
+        builder = builder.header("Access-Control-Max-Age", max_age.to_string());
+    }
+    if !g.expose_headers.is_empty() {
+        builder = builder.header("Access-Control-Expose-Headers", g.expose_headers.join(", "));
+    }
+    if g.vary_origin {
+        builder = builder.header(hyper::header::VARY, "Origin");
+    }
+    builder
+        .body(s3s::Body::empty())
+        .expect("preflight grant response builds")
+}
+
+/// The `403` preflight refusal: a CORS error body and **no** allow-origin header,
+/// mirroring what AWS returns so the browser blocks the pending request.
+fn preflight_refused_response() -> HttpResponse {
+    const BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<Error><Code>AccessForbidden</Code>\
+<Message>CORSResponse: This CORS request is not allowed. This is usually because the \
+evaluation of Origin, request method / Access-Control-Request-Method or \
+Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.</Message>\
+</Error>";
+    hyper::Response::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .header(hyper::header::CONTENT_TYPE, "application/xml")
+        .body(s3s::Body::from(BODY.to_owned()))
+        .expect("preflight refusal response builds")
 }
 
 /// Serve a `/_/…` request: the JSON/SSE API, a real embedded asset, or the SPA

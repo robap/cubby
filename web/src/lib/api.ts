@@ -109,6 +109,20 @@ export type NotificationDraft = {
   timeout_ms?: number;
 };
 
+/**
+ * One CORS rule as the read-only seam returns it — the S3 `CORSRule` field names
+ * (mirrors the Rust `cors::CorsRule` serialization), so the display speaks the
+ * same vocabulary as `aws s3api get-bucket-cors`.
+ */
+export type CorsInfo = {
+  AllowedOrigins: string[];
+  AllowedMethods: string[];
+  AllowedHeaders?: string[];
+  ExposeHeaders?: string[];
+  MaxAgeSeconds?: number;
+  ID?: string;
+};
+
 /** Percent-encode a key for use in an API path (keeping it readable). */
 function encKey(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
@@ -210,4 +224,14 @@ export function createNotification(
 /** `DELETE /_/api/buckets/{bucket}/notifications/{id}` — remove a destination. */
 export function deleteNotification(bucket: string, id: number): Promise<unknown> {
   return http.delete(`/_/api/buckets/${encodeURIComponent(bucket)}/notifications/${id}`);
+}
+
+/**
+ * `GET /_/api/buckets/{bucket}/cors` — the bucket's CORS rules (read-only), or
+ * `cors: null` when it has none. Management stays the S3 API; this is display.
+ */
+export function getCors(bucket: string): Promise<{ cors: CorsInfo[] | null }> {
+  return http.get<{ cors: CorsInfo[] | null }>(
+    `/_/api/buckets/${encodeURIComponent(bucket)}/cors`,
+  );
 }

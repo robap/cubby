@@ -14,8 +14,10 @@ import { crumbs, folderLabel, highlightParts, viewMode } from "../lib/browse.ts"
 import { baseName, fmtDate, humanBytes, truncateEnd } from "../lib/format.ts";
 import ObjectDetail from "../components/object-detail.ts";
 import NotificationsPanel from "../components/notifications-panel.ts";
+import CorsPanel from "../components/cors-panel.ts";
 import { ArchiveIcon, BucketIcon, DownloadIcon, FileIcon, FolderIcon, PlusIcon, TrashIcon } from "../components/icons.ts";
 import { closePanel, openPanel, panelOpen } from "../stores/notifications.ts";
+import { closePanel as closeCors, openPanel as openCors, panelOpen as corsPanelOpen } from "../stores/cors.ts";
 import {
   allBuckets,
   buckets,
@@ -181,11 +183,13 @@ function ListingPane(): TemplateResult {
     >
       ${SearchToolbar()}
       ${() =>
-        panelOpen.val
-          ? NotificationsPanel()
-          : viewMode(searchTerm.val) === "search"
-            ? SearchResults()
-            : FolderView()}
+        corsPanelOpen.val
+          ? CorsPanel()
+          : panelOpen.val
+            ? NotificationsPanel()
+            : viewMode(searchTerm.val) === "search"
+              ? SearchResults()
+              : FolderView()}
       <div class="drop-overlay align-center justify-center"><span>Drop to upload to ${() => `${selectedBucket.val ?? ""}/${prefix.val}`}</span></div>
     </div>
   `;
@@ -234,6 +238,10 @@ function SearchToolbar(): TemplateResult {
           }}
         </span>
         <button
+          class=${() => "cors-toggle button button-secondary button-sm" + (corsPanelOpen.val ? " active" : "")}
+          @click=${toggleCors}
+        >CORS</button>
+        <button
           class=${() => "notifications-toggle button button-secondary button-sm" + (panelOpen.val ? " active" : "")}
           @click=${toggleNotifications}
         >Notifications</button>
@@ -253,7 +261,27 @@ function toggleNotifications(): void {
     return;
   }
   const bucket = selectedBucket.val;
-  if (bucket) void openPanel(bucket);
+  if (bucket) {
+    closeCors(); // the two panels share the listing pane — only one at a time
+    void openPanel(bucket);
+  }
+}
+
+/**
+ * Toggle the read-only per-bucket CORS panel: open it (loading the bucket's
+ * rules) when closed, close it when open. A no-op with no bucket selected.
+ * @returns {void}
+ */
+function toggleCors(): void {
+  if (corsPanelOpen.val) {
+    closeCors();
+    return;
+  }
+  const bucket = selectedBucket.val;
+  if (bucket) {
+    closePanel(); // the two panels share the listing pane — only one at a time
+    void openCors(bucket);
+  }
 }
 
 /**

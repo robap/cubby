@@ -48,7 +48,7 @@ Conventions:
 | Version | Theme | Ships when |
 |---------|-------|-----------|
 | **v0.1** | MVP: the compatibility matrix passes | Build order steps 1–6 green in CI |
-| **v0.2** | Browser-facing: `--cors`, event webhooks, `reindex` | v0.1 stable + first real users |
+| **v0.2** | Browser-facing: per-bucket CORS API, event webhooks, `reindex` | v0.1 stable + first real users |
 | **v1.0** | Hardening, docs, distribution polish | v0.1 API frozen, no known correctness bugs |
 | **v1.1** | Virtual-host addressing (`*.localhost`) | v1.0 shipped |
 
@@ -163,8 +163,11 @@ in CI:
 
 First promotions once real users arrive.
 
-- **`--cors` flag.** Needed for browser→S3 direct access (presigned frontend
-  uploads). The presign button will tempt people to `fetch()` immediately.
+- **Per-bucket CORS API** (`PutBucketCors`/`GetBucketCors`/`DeleteBucketCors`,
+  SQLite-backed bucket state). Needed for browser→S3 direct access (presigned
+  frontend uploads); the presign button will tempt people to `fetch()`
+  immediately. Honoring the real S3 API means a developer's existing
+  `put-bucket-cors` bootstrap works unchanged. See `docs/features/cors-spec.md`.
 - **Event notifications via webhook.** "POST to my app when an object lands."
   Highest-value post-MVP feature — LocalStack gates this behind Pro. Same
   event struct that already feeds the live log.

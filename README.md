@@ -249,8 +249,10 @@ Path-style only (`http://host:port/<bucket>/<key>`). Virtual-host style
 ListMultipartUploads and UploadPartCopy (`x-amz-copy-source` on an UploadPart)
 are not implemented (`NotImplemented`). Copy-source conditional headers
 (`x-amz-copy-source-if-*`) are parsed and ignored. Browser cross-origin access
-to the S3 API needs CORS (`--cors`), a later flag; a presigned URL still works
-from a browser, only cross-origin `fetch()` is gated.
+to the S3 API needs a per-bucket CORS config — set through the real
+`PutBucketCors` S3 API, [documented below](#cors-browser-cross-origin-access-v02);
+a presigned URL still works from a browser, only cross-origin `fetch()` is gated
+until the bucket allows the page's origin.
 
 ## Web UI (Phase 5)
 
@@ -451,6 +453,76 @@ to trip a destination's `timeout_ms` while the upload still returns promptly) an
   identity.
 - **No signed/authenticated webhooks** (HMAC header, SNS signatures) in v0.2 —
   plain POST to a local dev endpoint.
+
+## CORS (browser cross-origin access, v0.2)
+
+The real browser→S3 flow is: your **backend** mints a presigned URL (SDK
+`generate_presigned_url` / `getSignedUrl`), hands it to your **frontend**, and
+the frontend `fetch()`es it cross-origin — a page on `http://localhost:3000`
+uploading to (or downloading from) cubby's S3 API on `http://localhost:9000`.
+For the browser to allow that, the **bucket** must have CORS configured.
+
+cubby honors the **same per-bucket S3 CORS API** as AWS — so your existing
+`put-bucket-cors` bootstrap or terraform/CDK works unchanged, and a bucket with
+no CORS behaves exactly like a fresh S3 bucket (the browser blocks it). It is
+**mutable bucket state in the data dir**, not a server flag: it changes at
+runtime with no restart and travels when you copy the dir.
+
+### Configure per bucket — the S3 API, live, no restart
+
+```bash
+aws --endpoint-url http://localhost:9000 s3api put-bucket-cors \
+  --bucket uploads --cors-configuration '{
+    "CORSRules": [{
+      "AllowedOrigins": ["http://localhost:3000"],
+      "AllowedMethods": ["GET","PUT","POST","HEAD"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 600
+    }]
+  }'
+
+aws --endpoint-url http://localhost:9000 s3api get-bucket-cors  --bucket uploads
+aws --endpoint-url http://localhost:9000 s3api delete-bucket-cors --bucket uploads
+```
+
+- `PutBucketCors` **replaces** the whole config (AWS semantics). `GetBucketCors`
+  on a bucket with none returns **`NoSuchCORSConfiguration`** (404) — the exact
+  error an SDK's "does this bucket have CORS?" probe expects. `DeleteBucketCors`
+  is idempotent (deleting when none exists still succeeds). Deleting the bucket
+  cascades its CORS away.
+- **Rule matching mirrors AWS**: rules are evaluated in order, first match wins;
+  `AllowedOrigins` supports a bare `*` and a single wildcard segment
+  (`https://*.example.com`); `AllowedMethods` ∈ {`GET`,`PUT`,`POST`,`DELETE`,`HEAD`};
+  `AllowedHeaders` supports `*` (matched case-insensitively against the
+  preflight's requested headers). A bare-`*` origin answers `*`; a specific or
+  wildcard origin echoes the request origin with `Vary: Origin`.
+- A cross-origin **preflight** (`OPTIONS` with `Origin` +
+  `Access-Control-Request-Method`) is answered at the routing layer **before**
+  auth — a preflight carries no signature — and shows up in the live log as a
+  `Preflight` event (origin + allowed/rejected), so "why is my browser upload
+  failing?" is answered in cubby's own stream. Actual responses (success **and**
+  error) gain `Access-Control-Allow-Origin` + `Access-Control-Expose-Headers` so
+  the browser lets JS read them (including the `ETag` an upload needs).
+- The **Web UI** shows a bucket's CORS config read-only (the **CORS** button in
+  the bucket browser) — management stays the S3 API, on purpose; the UI just
+  makes visible which origins a bucket allows.
+
+### The host-in-signature gotcha (same class as the Docker note)
+
+A presigned URL is signed **for a specific `host:port`** and must be fetched at
+that same origin — a URL signed for `localhost:9000` fails against
+`127.0.0.1:9000`, and vice versa (see the
+[Docker gotcha](#presigned-urls-query-string-auth) above). Note too that
+`http://localhost:3000` and `http://localhost:9000` are **different origins** by
+design — that's exactly the cross-origin boundary CORS governs; put your page's
+origin (`:3000`), not cubby's (`:9000`), in `AllowedOrigins`.
+
+Not in scope for v0.2: `Access-Control-Allow-Credentials` / cookie-authenticated
+CORS (presigned URLs authenticate via the query signature, not cookies), and
+CORS for the `/_/` web-UI seam (it's same-origin). A process-level allow-all
+flag is deliberately **not** offered — it would hide a missing-CORS misconfig
+that then breaks in prod.
 
 ## Seeding fixtures (`--seed`, Phase 6)
 

@@ -10,16 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CORSRule, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
     CopyObjectResult, CopySource, CreateBucketInput, CreateBucketOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
-    ETag, EncodingType, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput,
-    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
-    Metadata, MetadataDirective, Object, ObjectStorageClass, Owner, Part, PutObjectInput,
-    PutObjectOutput, StorageClass, StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketCorsInput,
+    DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, EncodingType,
+    GetBucketCorsInput, GetBucketCorsOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
+    HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
+    ListPartsOutput, Metadata, MetadataDirective, Object, ObjectStorageClass, Owner, Part,
+    PutBucketCorsInput, PutBucketCorsOutput, PutObjectInput, PutObjectOutput, StorageClass,
+    StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -1311,5 +1313,102 @@ impl s3s::S3 for Store {
             deleted,
             ..Default::default()
         }))
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let input = req.input;
+        let bucket = input.bucket;
+
+        // CORS is bucket state, so the bucket must exist.
+        let b = bucket.clone();
+        if !self.db_call(move |db| db.bucket_exists(&b)).await? {
+            return Err(s3_error!(NoSuchBucket, "no such bucket: {bucket}"));
+        }
+
+        // `s3s` parsed the XML; convert the DTO rules to our domain type, then
+        // validate (≥1 rule; each with ≥1 origin, ≥1 method; methods in the S3
+        // set) before storing. A bad config is rejected and persists nothing.
+        let rules: Vec<crate::cors::CorsRule> = input
+            .cors_configuration
+            .cors_rules
+            .into_iter()
+            .map(domain_rule_from_dto)
+            .collect();
+        if let Err(msg) = crate::cors::validate(&rules) {
+            return Err(s3_error!(InvalidRequest, "{msg}"));
+        }
+        let json = serde_json::to_string(&rules).map_err(internal)?;
+
+        // Whole-config replace (INSERT OR REPLACE) — AWS `PutBucketCors` semantics.
+        let b = bucket.clone();
+        self.db_call(move |db| db.put_bucket_cors(&b, &json))
+            .await?;
+
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        let bucket = req.input.bucket;
+
+        let b = bucket.clone();
+        let stored = self.db_call(move |db| db.get_bucket_cors(&b)).await?;
+        let Some(json) = stored else {
+            // The exact S3 error an SDK's "does this bucket have CORS?" probe
+            // expects when a bucket has none.
+            return Err(s3_error!(
+                NoSuchCORSConfiguration,
+                "no CORS configuration for bucket: {bucket}"
+            ));
+        };
+        let rules = crate::cors::parse_rules(&json).map_err(internal)?;
+        let cors_rules = rules.into_iter().map(dto_rule_from_domain).collect();
+
+        Ok(S3Response::new(GetBucketCorsOutput {
+            cors_rules: Some(cors_rules),
+        }))
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let bucket = req.input.bucket;
+        // Idempotent — deleting when none exists is not an error (AWS's tolerant
+        // 204). No bucket-existence check: a delete on a gone bucket is a no-op.
+        self.db_call(move |db| db.delete_bucket_cors(&bucket))
+            .await?;
+        Ok(S3Response::new(DeleteBucketCorsOutput::default()))
+    }
+}
+
+/// Convert an `s3s` `CORSRule` DTO (parsed from the XML) into our domain rule,
+/// flattening the `Option` list fields to empty vecs.
+fn domain_rule_from_dto(r: CORSRule) -> crate::cors::CorsRule {
+    crate::cors::CorsRule {
+        allowed_origins: r.allowed_origins,
+        allowed_methods: r.allowed_methods,
+        allowed_headers: r.allowed_headers.unwrap_or_default(),
+        expose_headers: r.expose_headers.unwrap_or_default(),
+        max_age_seconds: r.max_age_seconds,
+        id: r.id,
+    }
+}
+
+/// Convert a domain rule back into an `s3s` `CORSRule` DTO for `GetBucketCors`,
+/// re-wrapping empty list fields as `None` so the serialized XML omits them.
+fn dto_rule_from_domain(r: crate::cors::CorsRule) -> CORSRule {
+    CORSRule {
+        allowed_headers: (!r.allowed_headers.is_empty()).then_some(r.allowed_headers),
+        allowed_methods: r.allowed_methods,
+        allowed_origins: r.allowed_origins,
+        expose_headers: (!r.expose_headers.is_empty()).then_some(r.expose_headers),
+        id: r.id,
+        max_age_seconds: r.max_age_seconds,
     }
 }

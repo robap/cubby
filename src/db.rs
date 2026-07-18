@@ -538,6 +538,48 @@ impl Db {
             Ok(n == 1)
         })
     }
+
+    // --- Bucket CORS --------------------------------------------------------
+
+    /// Store a bucket's whole CORS configuration as one row (`INSERT OR REPLACE`,
+    /// matching S3's whole-config-replace `PutBucketCors`). `rules_json` is the
+    /// rule list already serialized (validated at the store layer before this is
+    /// called — the DB stores what it is given). Deleting the parent bucket
+    /// cascades this row away.
+    pub fn put_bucket_cors(&self, bucket: &str, rules_json: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO bucket_cors (bucket, rules) VALUES (?1, ?2)",
+                rusqlite::params![bucket, rules_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The bucket's stored CORS rules as the serialized JSON string, or `None`
+    /// when the bucket has no CORS configured. Consulted both by the config seam
+    /// (`GetBucketCors`) and the enforcement hot path (preflight + response
+    /// injection).
+    pub fn get_bucket_cors(&self, bucket: &str) -> rusqlite::Result<Option<String>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT rules FROM bucket_cors WHERE bucket = ?1",
+                [bucket],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
+
+    /// Remove a bucket's CORS configuration. Idempotent — deleting when none
+    /// exists removes zero rows and is **not** an error (AWS's tolerant
+    /// `DeleteBucketCors`).
+    pub fn delete_bucket_cors(&self, bucket: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute("DELETE FROM bucket_cors WHERE bucket = ?1", [bucket])?;
+            Ok(())
+        })
+    }
 }
 
 /// Build a [`NotificationRow`] from a `SELECT id, bucket, url, events, prefix,
@@ -751,6 +793,11 @@ CREATE TABLE IF NOT EXISTS bucket_notifications (
 
 CREATE INDEX IF NOT EXISTS bucket_notifications_by_bucket
     ON bucket_notifications (bucket);
+
+CREATE TABLE IF NOT EXISTS bucket_cors (
+    bucket TEXT PRIMARY KEY REFERENCES buckets(name) ON DELETE CASCADE,
+    rules  TEXT NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -1262,6 +1309,63 @@ mod tests {
             DeleteBucketOutcome::Deleted
         );
         assert!(db.list_bucket_notifications("uploads").unwrap().is_empty());
+    }
+
+    #[test]
+    fn put_then_get_round_trips_bucket_cors() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        // No config yet → None (the NoSuchCORSConfiguration signal upstream).
+        assert!(db.get_bucket_cors("uploads").unwrap().is_none());
+
+        let rules = r#"[{"AllowedOrigins":["http://localhost:3000"],"AllowedMethods":["PUT"]}]"#;
+        db.put_bucket_cors("uploads", rules).unwrap();
+        assert_eq!(
+            db.get_bucket_cors("uploads").unwrap().as_deref(),
+            Some(rules)
+        );
+    }
+
+    #[test]
+    fn put_bucket_cors_replaces_whole_config() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        db.put_bucket_cors("uploads", r#"[{"AllowedOrigins":["a"]}]"#)
+            .unwrap();
+        // A second put is a whole-config replace, not an append (S3 semantics).
+        db.put_bucket_cors("uploads", r#"[{"AllowedOrigins":["b"]}]"#)
+            .unwrap();
+        assert_eq!(
+            db.get_bucket_cors("uploads").unwrap().as_deref(),
+            Some(r#"[{"AllowedOrigins":["b"]}]"#)
+        );
+    }
+
+    #[test]
+    fn delete_bucket_cors_is_idempotent() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        db.put_bucket_cors("uploads", r#"[{"AllowedOrigins":["a"]}]"#)
+            .unwrap();
+        db.delete_bucket_cors("uploads").unwrap();
+        assert!(db.get_bucket_cors("uploads").unwrap().is_none());
+        // A second delete when none exists is not an error (AWS's tolerant 204).
+        db.delete_bucket_cors("uploads").unwrap();
+    }
+
+    #[test]
+    fn deleting_bucket_cascades_its_cors() {
+        let (_tmp, db) = open_temp();
+        db.create_bucket("uploads", 0).unwrap();
+        db.put_bucket_cors("uploads", r#"[{"AllowedOrigins":["a"]}]"#)
+            .unwrap();
+        // An empty bucket (CORS config isn't an object) deletes cleanly, and the
+        // FK ON DELETE CASCADE removes its cors row.
+        assert_eq!(
+            db.try_delete_bucket("uploads").unwrap(),
+            DeleteBucketOutcome::Deleted
+        );
+        assert!(db.get_bucket_cors("uploads").unwrap().is_none());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! SPA `index.html` (that split is what keeps client-side deep links working).
 
 mod buckets;
+mod cors;
 mod events;
 mod health;
 mod notifications;
@@ -54,6 +55,11 @@ pub async fn dispatch(req: hyper::Request<Incoming>, state: &Arc<AppState>) -> R
             if let Some((bucket, id)) = parse_notifications_path(&sub) {
                 return notifications::route(method, req, state, bucket, id).await;
             }
+            // `buckets/{bucket}/cors` (read-only display) is matched before the
+            // objects fallback, like the notifications seam.
+            if let Some(bucket) = parse_cors_path(&sub) {
+                return cors::route(method, state, bucket);
+            }
             match parse_objects_path(&sub) {
                 Some((bucket, key)) => objects::route(method, req, state, bucket, key).await,
                 None => error(
@@ -82,6 +88,20 @@ fn parse_notifications_path(sub: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     Some((bucket.to_owned(), id.map(str::to_owned)))
+}
+
+/// Parse a `buckets/{bucket}/cors` path tail into its bucket. The bucket has no
+/// `/`, so the `/cors` literal is the separator and nothing may follow it.
+/// Returns `None` for non-cors paths.
+fn parse_cors_path(sub: &str) -> Option<String> {
+    let rest = sub.strip_prefix("buckets/")?;
+    let (bucket, tail) = rest.split_once("/cors")?;
+    // The bucket is a single segment and `/cors` is the whole tail — a deeper
+    // path (or an object key that merely embeds `/cors`) is not this endpoint.
+    if bucket.is_empty() || bucket.contains('/') || !tail.is_empty() {
+        return None;
+    }
+    Some(bucket.to_owned())
 }
 
 /// Parse a `buckets/{bucket}/objects[/{key}]` path tail into its bucket and
@@ -202,5 +222,20 @@ mod tests {
             parse_notifications_path("buckets/uploads/notifications/7/extra"),
             None
         );
+    }
+
+    #[test]
+    fn parse_cors_path_matches_only_the_bucket_collection() {
+        assert_eq!(
+            parse_cors_path("buckets/uploads/cors"),
+            Some("uploads".to_owned())
+        );
+        // Not a cors path: objects, a deeper path, or a bare buckets path.
+        assert_eq!(parse_cors_path("buckets/uploads/objects/k"), None);
+        assert_eq!(parse_cors_path("buckets/uploads/cors/extra"), None);
+        assert_eq!(parse_cors_path("buckets"), None);
+        // An object key that embeds `/cors` deeper does not match (bucket would
+        // contain a slash).
+        assert_eq!(parse_cors_path("buckets/uploads/objects/cors"), None);
     }
 }

@@ -132,8 +132,9 @@ The subset AWS SDKs actually exercise during app development:
 
 ### Deliberately NOT in MVP
 
-CORS (fast-follow `--cors` flag — v0.2, needed only for browser→S3 direct
-access like presigned frontend uploads; note in docs), versioning, object
+CORS (fast-follow v0.2 — the real per-bucket `PutBucketCors`/`GetBucketCors`/
+`DeleteBucketCors` API, needed for browser→S3 direct access like presigned
+frontend uploads; see `docs/features/cors-spec.md`), versioning, object
 lock, lifecycle, SSE/KMS, bucket policies/IAM, replication, storage classes,
 tagging. First post-MVP promotion: **event notifications via webhook**
 ("POST to my app when an object lands" — LocalStack gates this behind Pro).
@@ -211,8 +212,9 @@ Steps 1–4 ≈ 2–3 weeks of evenings given `s3s` does the protocol.
   `localhost:9000` fail against `http://tool:9000` inside Docker Compose
   and vice versa. Inherent to SigV4; one README paragraph preempts the
   most common Docker issue report.
-- Browser access to the S3 API needs `--cors` (v0.2); the presign button
-  will tempt people to `fetch()` the URL from a frontend.
+- Browser access to the S3 API needs a bucket CORS config (v0.2, the real
+  `PutBucketCors` API); the presign button will tempt people to `fetch()` the
+  URL from a frontend.
 
 ## Distribution
 

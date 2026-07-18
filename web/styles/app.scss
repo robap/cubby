@@ -568,6 +568,23 @@
   min-height: 0;
 }
 
+// The read-only CORS panel shares the notifications panel's fill/scroll shape.
+.cors-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+.cors-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+// A fixed label column keeps a rule's origins/methods/headers aligned.
+.cors-field-label {
+  flex: 0 0 8rem;
+}
+
 // Set the "All events" toggle apart from the individual event boxes.
 .event-check-all {
   font-weight: var(--weight-semi);

@@ -13,6 +13,8 @@ import {
   allBuckets, buckets, folder, objectMeta, prefix,
   presignedUrl, searchResults, searchTerm, selectedBucket, selectedObject, setSearch,
 } from "../stores/browse.ts";
+import { panelOpen as corsPanelOpen, rules as corsRules } from "../stores/cors.ts";
+import { panelOpen as notifPanelOpen } from "../stores/notifications.ts";
 
 /** Reset the module-level store between tests. */
 function resetStore(): void {
@@ -26,6 +28,9 @@ function resetStore(): void {
   selectedObject.set(null);
   objectMeta.set(null);
   presignedUrl.set(null);
+  corsPanelOpen.set(false);
+  corsRules.set(null);
+  notifPanelOpen.set(false);
 }
 
 type StubRoute = (url: string, method: string) => unknown;
@@ -349,5 +354,46 @@ describe("Browser", () => {
     await tick();
     expect(find(el, ".search-results")).not.toBe(null);
     expect(find(el, ".search-field input")).toBe(before);
+  });
+
+  it("the CORS toggle opens the read-only CORS panel for the selected bucket", async () => {
+    buckets.set([bucket({ name: "uploads" })]);
+    selectedBucket.set("uploads");
+    folder.set(folderView());
+    stubFetch(() => ({
+      cors: [{
+        AllowedOrigins: ["http://localhost:3000"],
+        AllowedMethods: ["GET", "PUT"],
+        ExposeHeaders: ["ETag"],
+        MaxAgeSeconds: 600,
+      }],
+    }));
+
+    const el = render(Browser());
+    fire(find(el, ".cors-toggle")!, "click");
+    await tick();
+
+    expect(find(el, ".cors-panel")).not.toBe(null);
+    expect(text(el, ".cors-list")).toContain("http://localhost:3000");
+    expect(text(el, ".cors-list")).toContain("ETag");
+  });
+
+  it("opening CORS closes the notifications panel (they share the pane)", async () => {
+    buckets.set([bucket({ name: "uploads" })]);
+    selectedBucket.set("uploads");
+    folder.set(folderView());
+    stubFetch((url) =>
+      url.includes("/cors") ? { cors: null } : { notifications: [] });
+
+    const el = render(Browser());
+    // Open notifications first.
+    fire(find(el, ".notifications-toggle")!, "click");
+    await tick();
+    expect(find(el, ".notifications-panel")).not.toBe(null);
+    // Now open CORS — notifications must close, CORS must show.
+    fire(find(el, ".cors-toggle")!, "click");
+    await tick();
+    expect(find(el, ".notifications-panel")).toBe(null);
+    expect(find(el, ".cors-panel")).not.toBe(null);
   });
 });

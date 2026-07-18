@@ -9,6 +9,7 @@ pub mod access_log;
 pub mod api;
 pub mod banner;
 pub mod cli;
+pub mod cors;
 pub mod datadir;
 pub mod db;
 pub mod embed;
