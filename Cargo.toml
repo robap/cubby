@@ -1,6 +1,6 @@
 [package]
 name = "cubby"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "The SQLite of S3 — a single-binary, S3-compatible object store for local development"
 license = "MIT"
