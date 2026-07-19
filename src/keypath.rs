@@ -16,9 +16,9 @@
 //! The trailing-dot rule also neutralizes `.` and `..` segments (they become
 //! `%2E` / `%2E%2E`), so a crafted key can never traverse out of its bucket.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
-use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{percent_decode_str, percent_encode, AsciiSet, CONTROLS};
 
 /// Characters that are illegal in filenames on Windows (and `%`, so the
 /// encoding is reversible in principle / injective in practice). `CONTROLS`
@@ -41,6 +41,33 @@ pub fn key_to_relpath(key: &str) -> PathBuf {
         path.push(encode_segment(segment));
     }
     path
+}
+
+/// Recover the canonical S3 key from a bucket-relative filesystem path — the
+/// exact inverse of [`key_to_relpath`]. Split the path into components,
+/// percent-decode each one, and join with `/`.
+///
+/// This is **the one place cubby decodes a filename back into a key** (the
+/// sanctioned reindex exception to CONCEPT's "never decode filenames back into
+/// keys" serving rule). The inverse is exact because `key_to_relpath` is
+/// encode-only and injective: `%` is always encoded, so no `%XX` on disk is
+/// ambiguous. For a plain drop-in file with no `%XX` (the common case) the
+/// inverse is the identity — "what I copied in is the key".
+pub fn relpath_to_key(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => Some(os.to_string_lossy()),
+            // A bucket-relative path holds only normal components (the encoder
+            // neutralizes `.`/`..`); ignore anything else defensively.
+            _ => None,
+        })
+        .map(|comp| {
+            percent_decode_str(comp.as_ref())
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Encode one `/`-delimited key segment into a safe path component.
@@ -183,6 +210,43 @@ mod tests {
         assert_eq!(rel("COM0"), "COM0");
         assert_eq!(rel("CONTROL"), "CONTROL");
         assert_eq!(rel("console"), "console");
+    }
+
+    #[test]
+    fn relpath_to_key_is_the_exact_inverse() {
+        // Every tricky case must survive a full key → path → key round-trip,
+        // proving reindex recovers the original key from bytes alone.
+        for key in [
+            "report.pdf",
+            "photos/cat.jpg",
+            "a:b",
+            "100%.txt",
+            "CON",
+            "name.",
+            "..",
+            "weird:name?.txt",
+            "a<>:\"|?*\\b",
+            "v1.2.3",
+            "a. ./b",
+            "%3A",
+        ] {
+            let rel = key_to_relpath(key);
+            assert_eq!(
+                relpath_to_key(&rel),
+                key,
+                "round-trip failed for {key:?} (path {rel:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn relpath_to_key_of_a_plain_path_is_identity() {
+        // A hand-dropped file with no `%XX` maps to itself — "the key is the path".
+        assert_eq!(
+            relpath_to_key(&PathBuf::from("photos").join("cat.jpg")),
+            "photos/cat.jpg"
+        );
+        assert_eq!(relpath_to_key(&PathBuf::from("report.pdf")), "report.pdf");
     }
 
     #[test]

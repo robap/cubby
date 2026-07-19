@@ -31,5 +31,17 @@ fn main() -> anyhow::Result<()> {
                 seed: args.seed,
             }))
         }
+        Command::Reindex(args) => {
+            // Offline batch: no tokio runtime, no port. `bootstrap()` first so a
+            // bare byte tree with no `meta.sqlite` still works.
+            let dir = DataDir::new(&args.dir);
+            dir.bootstrap()?;
+            let db = Db::open(&dir.meta_db_path())?;
+
+            let report = cubby::reindex::run(&dir, &db)?;
+            println!("reindexed {}", dir.root().display());
+            println!("{report}");
+            Ok(())
+        }
     }
 }

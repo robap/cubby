@@ -78,7 +78,11 @@ GET  uploads/photos/cat.jpg   200    3ms   2.4MB
   truth for what exists; the filesystem is where bytes live.
 - Canonical S3 key stored in SQLite; filesystem path is *derived* from it
   (percent-encode the small Windows-illegal set — `<>:"|?*`, trailing
-  dots/spaces, reserved names). Never decode filenames back into keys.
+  dots/spaces, reserved names). Never decode filenames back into keys on the
+  serving path — listings come from SQLite, not `readdir`. The one sanctioned
+  exception is `reindex` (v0.2): because the encoding is injective (`%` is always
+  encoded), it reverses the exact inverse to recover keys from bytes when
+  rebuilding a lost or absent index.
 - Streaming writes: temp file in `.tmp/` → hash incrementally (never buffer
   whole objects) → fsync → rename into place → SQLite insert. Crash between
   rename and insert leaves a harmless orphaned file (sweepable). Deletes:
@@ -232,7 +236,9 @@ Docker is a footnote. Compose snippet in README from day one.
   ships via crates.io/Docker without `zero`. Regenerate with `zero build` before
   committing; no CI freshness gate (CI has no `zero`). See
   `docs/features/distribution-spec.md`.
-- `reindex` command (scan tree, backfill SQLite) for the "seed by copying
-  files into the dir" workflow — v0.2 candidate.
+- ~~`reindex` command (scan tree, backfill SQLite) for the "seed by copying
+  files into the dir" workflow — v0.2 candidate.~~ **Shipped (v0.2):** `cubby
+  reindex <dir>` adopts hand-dropped files and rebuilds a lost index; see
+  `docs/features/reindex-spec.md`.
 - Language-specific test helpers (`with local_s3() as s3:`) — S3
   integration testing may be a bigger market than dev environments.

@@ -568,8 +568,58 @@ buckets:
   is fine for a dev tool; the loud exit is what matters.
 
 Out of scope (per CONCEPT): adopting pre-existing loose files in `buckets/`
-(that's a future `reindex`), and seeding anything beyond buckets and finished
-objects (no multipart state, versions, or per-bucket config).
+(that's [`reindex`](#reindex-adopt-hand-dropped-files-reindex-v02)), and seeding
+anything beyond buckets and finished objects (no multipart state, versions, or
+per-bucket config).
+
+## Reindex — adopt hand-dropped files (`reindex`, v0.2)
+
+`--seed` writes *new* fixtures through the PutObject path; **`cubby reindex
+<dir>`** goes the other way — it scans an existing data dir and backfills
+`meta.sqlite` for files that are already on disk but have no row. This makes *the
+filesystem is the API too* bidirectional: **copy files into `buckets/` by hand,
+then reindex, then serve them.**
+
+```console
+$ mkdir -p s3data/buckets/uploads/photos
+$ cp report.pdf     s3data/buckets/uploads/
+$ cp cat.jpg        s3data/buckets/uploads/photos/
+$ cubby reindex s3data
+reindexed s3data
+  buckets: 1 adopted, 0 already present
+  objects: 2 indexed, 0 already present, 0 skipped
+$ cubby serve s3data      # aws s3 ls s3://uploads/ now shows both objects
+```
+
+`reindex` is an **offline** command: it opens `meta.sqlite`, mutates the index,
+prints a summary, and exits — it never binds a port, so it composes with `cp -r`,
+`git checkout`, and `tar -x` in a shell script. It also doubles as a **recovery
+tool**: `rm meta.sqlite && cubby reindex s3data` rebuilds the entire index from
+the byte tree alone.
+
+- **Every directory directly under `buckets/` is a bucket** (adopted if it has no
+  row; the directory name *is* the bucket name). **Every regular file beneath a
+  bucket dir is an object**, keyed by its bucket-relative path with each path
+  component percent-decoded back into a key segment — so a nested
+  `uploads/photos/cat.jpg` recovers as that key, and a file cubby itself wrote for
+  a tricky key (`a:b` → `a%3Ab` on disk) recovers `a:b` exactly.
+- **Additive and non-destructive.** A file that already has a row is left
+  untouched — its real content-type, user metadata, and multipart `-N` ETag are
+  preserved, and its bytes are not re-hashed. Re-running over an unchanged tree
+  indexes **0** objects — cheap and idempotent. (Orphan-row pruning and
+  changed-file re-hashing are deliberately out of scope; later `--prune` /
+  `--force` opt-ins.)
+- **Recovered vs. lost fields.** `size` (stat), `etag` (streamed content-MD5),
+  and `last_modified` (the file's mtime) are exact; `content_type` is guessed
+  from the extension via a small built-in table (`.txt`→`text/plain`,
+  `.png`→`image/png`, …), falling back to `application/octet-stream`. Two inherent
+  losses: an adopted file gets a **single-part ETag** even if it was originally
+  uploaded via multipart (the part boundaries are gone), and **user metadata is
+  `{}`** (never stored on disk, so unrecoverable).
+- **Skips** symlinks (never followed, so it can't escape the tree) and loose
+  files sitting directly under `buckets/` (they belong to no bucket). cubby's own
+  siblings — `meta.sqlite`, `.tmp/`, `.multipart/` — live *outside* `buckets/` and
+  are never visited.
 
 ## Conformance matrix (Phase 6, the v0.1 promise)
 
@@ -609,7 +659,10 @@ it fails the job instead, so a real regression can't hide behind a green skip.
 - **Deletes** remove the SQLite row first, then unlink the file.
 - The on-disk path is **derived** from the canonical key (percent-encoding the
   Windows-illegal set `<>:"|?*`, trailing dots/spaces, and reserved device
-  names) and is never decoded back into a key.
+  names) and is never decoded back into a key on the serving path — listings come
+  from SQLite, never `readdir`. The lone sanctioned exception is
+  [`reindex`](#reindex-adopt-hand-dropped-files-reindex-v02), which reverses that
+  exact (injective) mapping to recover keys from bytes alone.
 
 ## License
 

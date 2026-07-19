@@ -43,6 +43,28 @@ impl TestServer {
             .expect("spawn seeded server")
     }
 
+    /// Spawn a server whose data dir was first populated by `build` (which
+    /// hand-creates files under `buckets/`, no rows yet) and then processed by
+    /// `reindex::run` — the in-process analogue of `cubby reindex <dir>` followed
+    /// by `cubby serve <dir>`. Returns the running server and the reindex report,
+    /// so a test can assert both the served objects and the tallies.
+    pub async fn spawn_reindexed(
+        build: impl FnOnce(&DataDir),
+    ) -> (Self, cubby::reindex::ReindexReport) {
+        let tmp = tempfile::tempdir().unwrap();
+        let datadir = DataDir::new(tmp.path());
+        datadir.bootstrap().unwrap();
+
+        // Populate the byte tree by hand, then reindex against the same dir the
+        // server will serve (a single Db handle carries into the server config).
+        build(&datadir);
+        let db = Db::open(&datadir.meta_db_path()).unwrap();
+        let report = cubby::reindex::run(&datadir, &db).expect("reindex run");
+
+        let server = Self::serve_datadir(tmp, datadir, db).await;
+        (server, report)
+    }
+
     async fn spawn_inner(seed: Option<PathBuf>) -> anyhow::Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
         let datadir = DataDir::new(tmp.path());
@@ -57,6 +79,13 @@ impl TestServer {
             cubby::seed::apply(seed_path, &store).await?;
         }
 
+        Ok(Self::serve_datadir(tmp, datadir, db).await)
+    }
+
+    /// Bind an ephemeral port and start serving `datadir`/`db`, returning the
+    /// live `TestServer`. Shared by every spawn variant (fresh, seeded,
+    /// reindexed) so they all stand up the router the same way.
+    async fn serve_datadir(tmp: TempDir, datadir: DataDir, db: Db) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -75,12 +104,12 @@ impl TestServer {
         let router = build_router(&cfg);
         tokio::spawn(run_accept_loop(listener, router));
 
-        Ok(Self {
+        Self {
             addr,
             datadir,
             events,
             _tmp: tmp,
-        })
+        }
     }
 
     /// A client signing with the correct default credentials.

@@ -1,7 +1,10 @@
 //! Command-line interface.
 //!
-//! `cubby serve <dir>` is the only subcommand for now; it boots the S3 server
-//! against a data directory, creating it (and its layout) on first run.
+//! `cubby serve <dir>` boots the S3 server against a data directory, creating it
+//! (and its layout) on first run. `cubby reindex <dir>` is the offline
+//! maintenance sibling: it scans `buckets/` and backfills `meta.sqlite` so
+//! hand-dropped files become first-class objects, then exits without binding a
+//! port.
 
 use std::path::PathBuf;
 
@@ -27,6 +30,11 @@ pub struct Cli {
 pub enum Command {
     /// Serve the S3 API against a data directory.
     Serve(ServeArgs),
+
+    /// Scan `buckets/` and backfill `meta.sqlite` for hand-dropped files, then
+    /// exit. Offline and additive: never binds a port, only inserts rows for
+    /// files with no row (already-indexed objects are left untouched).
+    Reindex(ReindexArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -63,6 +71,14 @@ pub struct ServeArgs {
     pub seed: Option<PathBuf>,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct ReindexArgs {
+    /// Data directory to reindex. `bootstrap()`ed first (harmless, idempotent),
+    /// so a bare tree holding only `buckets/<b>/<files>` and no `meta.sqlite`
+    /// still works — the "rebuild the index from bytes" case.
+    pub dir: PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,7 +92,9 @@ mod tests {
     #[test]
     fn serve_parses_dir_and_defaults() {
         let cli = Cli::try_parse_from(["cubby", "serve", "./s3data"]).unwrap();
-        let Command::Serve(args) = cli.command;
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve subcommand");
+        };
         assert_eq!(args.dir, PathBuf::from("./s3data"));
         assert_eq!(args.bind, "127.0.0.1");
         assert_eq!(args.port, 9000);
@@ -89,8 +107,25 @@ mod tests {
     #[test]
     fn serve_parses_seed_path() {
         let cli = Cli::try_parse_from(["cubby", "serve", "data", "--seed", "seed.yaml"]).unwrap();
-        let Command::Serve(args) = cli.command;
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve subcommand");
+        };
         assert_eq!(args.seed, Some(PathBuf::from("seed.yaml")));
+    }
+
+    #[test]
+    fn reindex_parses_dir() {
+        let cli = Cli::try_parse_from(["cubby", "reindex", "./s3data"]).unwrap();
+        let Command::Reindex(args) = cli.command else {
+            panic!("expected reindex subcommand");
+        };
+        assert_eq!(args.dir, PathBuf::from("./s3data"));
+    }
+
+    #[test]
+    fn reindex_takes_no_serve_flags() {
+        // reindex is offline — bind/port/credentials are not accepted.
+        assert!(Cli::try_parse_from(["cubby", "reindex", "data", "--port", "0"]).is_err());
     }
 
     #[test]
@@ -109,7 +144,9 @@ mod tests {
             "sk",
         ])
         .unwrap();
-        let Command::Serve(args) = cli.command;
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve subcommand");
+        };
         assert_eq!(args.bind, "0.0.0.0");
         assert_eq!(args.port, 0);
         assert_eq!(args.access_key, "ak");

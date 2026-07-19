@@ -20,5 +20,6 @@ pub mod listing;
 pub mod multipart;
 pub mod notify;
 pub mod presign;
+pub mod reindex;
 pub mod seed;
 pub mod store;
